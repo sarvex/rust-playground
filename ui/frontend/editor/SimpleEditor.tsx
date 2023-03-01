@@ -1,4 +1,5 @@
 import React from 'react';
+import { isEqual } from 'lodash';
 
 import { CommonEditorProps, Position, Selection } from '../types';
 
@@ -80,7 +81,7 @@ class SimpleEditor extends React.PureComponent<CommonEditorProps> {
     const editor = this._editor;
 
     if (!newPosition || !editor) { return; }
-    if (newPosition === oldPosition) { return; }
+    if (isEqual(newPosition, oldPosition)) { return; }
 
     const offsets = new CodeByteOffsets(this.props.code);
     const [startBytes, endBytes] = offsets.lineToOffsets(newPosition.line);
@@ -93,7 +94,7 @@ class SimpleEditor extends React.PureComponent<CommonEditorProps> {
     const editor = this._editor;
 
     if (!newSelection || !newSelection.start || !newSelection.end || !editor) { return; }
-    if (newSelection === oldSelection) { return; }
+    if (isEqual(newSelection, oldSelection)) { return; }
 
     const offsets = new CodeByteOffsets(this.props.code);
     const [startBytes, endBytes] = offsets.rangeToOffsets(newSelection.start, newSelection.end);
