@@ -3,7 +3,7 @@
 // playground.
 
 import State from './state';
-import {removeVersion, initializeStorage, PartialState} from './storage';
+import {moveCode, removeVersion, initializeStorage, PartialState, MovedCode} from './storage';
 import { AssemblyFlavor, DemangleAssembly, Editor, Orientation, PairCharacters, ProcessAssembly } from './types';
 import { codeSelector } from './selectors';
 
@@ -100,16 +100,22 @@ function migrate(state: V1Configuration | V2Configuration): CurrentConfiguration
   }
 }
 
+function rename(result: V2Configuration): MovedCode<V2Configuration> {
+  return moveCode(result);
+}
+
 export function deserialize(savedState: string): PartialState {
   if (!savedState) { return undefined; }
 
   const parsedState = JSON.parse(savedState);
   if (!parsedState) { return undefined; }
 
-  const result = migrate(parsedState);
-  if (!result) { return undefined; }
+  const migrated = migrate(parsedState);
+  if (!migrated) { return undefined; }
 
-  return removeVersion(result);
+  const renamed = rename(migrated);
+
+  return removeVersion(renamed);
 }
 
 export default initializeStorage({

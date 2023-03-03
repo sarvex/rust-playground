@@ -13,6 +13,16 @@ export interface Selection {
   end?: Position;
 }
 
+export interface File {
+  code: string;
+  position: Position;
+  selection: Selection;
+  lastEdited: Date;
+  lastSaved?: Date;
+}
+
+export type Entries = { [k: string]: File };
+
 export interface Crate {
   id: string;
   name: string;

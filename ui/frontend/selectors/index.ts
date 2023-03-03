@@ -14,9 +14,17 @@ import {
   Version,
 } from '../types';
 
-export const codeSelector = (state: State) => state.code;
-export const positionSelector = (state: State) => state.position;
-export const selectionSelector = (state: State) => state.selection;
+const currentEntryNameSelector = (state: State) => state.files.current;
+const entriesSelector = (state: State) => state.files.entries;
+
+const currentEntrySelector = createSelector(
+  currentEntryNameSelector,
+  entriesSelector,
+  (name, entries) => ({ ...entries[name], name }));
+
+export const codeSelector = createSelector(currentEntrySelector, entry => entry.code);
+export const positionSelector = createSelector(currentEntrySelector, entry => entry.position);
+export const selectionSelector = createSelector(currentEntrySelector, entry => entry.selection);
 
 const HAS_TESTS_RE = /^\s*#\s*\[\s*test\s*([^"]*)]/m;
 export const hasTestsSelector = createSelector(codeSelector, code => !!code.match(HAS_TESTS_RE));

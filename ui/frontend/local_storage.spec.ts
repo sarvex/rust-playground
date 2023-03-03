@@ -26,7 +26,7 @@ describe('restoring saved state', () => {
     });
 
     expect(parsed?.configuration?.orientation).toEqual('vertical');
-    expect(parsed?.code).toEqual('not default code');
+    expect(parsed?.files?.entries).toEqual('not default code');
     expect(parsed?.notifications?.seenRustSurvey2018).toBe(true);
   });
 

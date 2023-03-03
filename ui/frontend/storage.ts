@@ -1,6 +1,7 @@
 import { DeepPartial } from 'ts-essentials';
 
 import State from './state';
+import { makeState } from './reducers/files';
 
 type SimpleStorage = Pick<Storage, 'getItem' | 'setItem'>;
 
@@ -17,6 +18,19 @@ interface Config {
 interface InitializedStorage {
   initialState: PartialState;
   saveChanges: (state: State) => void;
+}
+
+type FileStateSlice = Pick<State, 'files'>;
+export type MovedCode<T> = Omit<T, 'code'> & FileStateSlice;
+
+export function moveCode<T extends { code: string }>(data: T): MovedCode<T> {
+  const code = data.code;
+
+  const munged: Record<string, unknown> = {...data};
+  delete munged.code;
+  const removed = munged as Omit<T, 'code'>;
+
+  return { ...removed, files: makeState(code) };
 }
 
 export function removeVersion<T extends { version: unknown }>(data: T): Omit<T, 'version'> {

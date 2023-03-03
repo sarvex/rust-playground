@@ -3,21 +3,36 @@
 // when we reopen a closed tab.
 
 import { State } from './reducers';
-import {removeVersion, initializeStorage, PartialState} from './storage';
+import {moveCode, removeVersion, initializeStorage, PartialState, MovedCode} from './storage';
 import { codeSelector } from './selectors';
+import { PrimaryAction } from './types';
 
 const CURRENT_VERSION = 1;
 
+interface V1Configuration {
+  version: 1;
+  configuration: {
+    primaryAction: PrimaryAction,
+  };
+  code: string;
+}
+
+type CurrentConfiguration = V1Configuration;
+
 export function serialize(state: State): string {
   const code = codeSelector(state);
-
-  return JSON.stringify({
+  const conf: CurrentConfiguration = {
     version: CURRENT_VERSION,
     configuration: {
       primaryAction: state.configuration.primaryAction,
     },
     code,
-  });
+  };
+  return JSON.stringify(conf);
+}
+
+function rename(result: V1Configuration): MovedCode<V1Configuration> {
+  return moveCode(result);
 }
 
 export function deserialize(savedState: string): PartialState {
@@ -28,11 +43,9 @@ export function deserialize(savedState: string): PartialState {
 
   if (parsedState.version !== CURRENT_VERSION) { return undefined; }
 
-  // This assumes that the keys we serialize with match the keys in the
-  // live state. If that's no longer true, an additional renaming step
-  // needs to be added.
+  const renamed = rename(parsedState);
 
-  return removeVersion(parsedState);
+  return removeVersion(renamed);
 }
 
 export default initializeStorage({
