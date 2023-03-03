@@ -3,6 +3,7 @@ import { useDispatch, useSelector } from 'react-redux';
 import Split from 'split-grid';
 
 import Editor from './editor/Editor';
+import MultiEditor from './MultiEditor';
 import Header from './Header';
 import Notifications from './Notifications';
 import Output from './Output';
@@ -76,7 +77,7 @@ const ResizableArea: React.FC = () => {
 
   return (
     <div ref={grid} className={gridStyle}>
-      <div className={styles.editor}><Editor /></div>
+      <div className={styles.editor}><MultiEditor /></div>
       { isFocused &&
         <div ref={dragHandle} className={handleOuterStyle}>
           <span className={handleInnerStyle}>⣿</span>

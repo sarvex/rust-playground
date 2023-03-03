@@ -8,6 +8,7 @@ use crate::{
 use axum::extract::ws::{Message, WebSocket};
 use snafu::prelude::*;
 use std::{
+    collections::BTreeMap,
     convert::{TryFrom, TryInto},
     time::Instant,
 };
@@ -18,6 +19,14 @@ use tokio::{sync::mpsc, task::JoinSet};
 enum WSMessageRequest {
     #[serde(rename = "WS_EXECUTE_REQUEST")]
     WSExecuteRequest(WSExecuteRequest),
+
+    #[serde(rename = "SAVE_FILES")]
+    SaveFiles { entries: BTreeMap<String, File> },
+}
+
+#[derive(Debug, serde::Deserialize)]
+struct File {
+    code: String,
 }
 
 #[derive(serde::Deserialize)]
@@ -202,6 +211,9 @@ async fn handle_msg(
                 tx.send(resp).await.ok(/* We don't care if the channel is closed */);
                 Ok(())
             });
+        }
+        Ok(SaveFiles { entries }) => {
+            dbg!(entries);
         }
         Err(e) => {
             let resp = Err(e);

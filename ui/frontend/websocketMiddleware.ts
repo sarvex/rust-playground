@@ -113,4 +113,5 @@ export const websocketMiddleware = (window: Window): Middleware => store => {
 }
 
 const sendActionOnWebsocket = (action: any): boolean =>
-  action.type === ActionType.WSExecuteRequest;
+  action.type === ActionType.WSExecuteRequest
+|| action.type === ActionType.SaveFiles;

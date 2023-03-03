@@ -14,10 +14,10 @@ import {
   Version,
 } from '../types';
 
-const currentEntryNameSelector = (state: State) => state.files.current;
-const entriesSelector = (state: State) => state.files.entries;
+export const currentEntryNameSelector = (state: State) => state.files.current;
+export const entriesSelector = (state: State) => state.files.entries;
 
-const currentEntrySelector = createSelector(
+export const currentEntrySelector = createSelector(
   currentEntryNameSelector,
   entriesSelector,
   (name, entries) => ({ ...entries[name], name }));

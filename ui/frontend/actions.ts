@@ -19,6 +19,7 @@ import {
   DemangleAssembly,
   Edition,
   Editor,
+  Entries,
   Focus,
   Mode,
   Notification,
@@ -105,6 +106,9 @@ export enum ActionType {
   EnableFeatureGate = 'ENABLE_FEATURE_GATE',
   GotoPosition = 'GOTO_POSITION',
   SelectText = 'SELECT_TEXT',
+  EditFile = 'EDIT_FILE',
+  SelectFile = 'SELECT_FILE',
+  SaveFiles = 'SAVE_FILES',
   RequestFormat = 'REQUEST_FORMAT',
   FormatSucceeded = 'FORMAT_SUCCEEDED',
   FormatFailed = 'FORMAT_FAILED',
@@ -573,6 +577,13 @@ export const gotoPosition = (line: string | number, column: string | number) =>
 export const selectText = (start: Position, end: Position) =>
   createAction(ActionType.SelectText, { start, end });
 
+export const editFile = (name: string, code: string) =>
+  createAction(ActionType.EditFile, { name, code });
+
+export const selectFile = (name: string) => createAction(ActionType.SelectFile, { name });
+
+export const saveFiles = (entries: Entries) => createAction(ActionType.SaveFiles, { entries });
+
 const requestFormat = () =>
   createAction(ActionType.RequestFormat);
 
@@ -1002,6 +1013,9 @@ export type Action =
   | ReturnType<typeof enableFeatureGate>
   | ReturnType<typeof gotoPosition>
   | ReturnType<typeof selectText>
+  | ReturnType<typeof editFile>
+  | ReturnType<typeof selectFile>
+  | ReturnType<typeof saveFiles>
   | ReturnType<typeof requestFormat>
   | ReturnType<typeof receiveFormatSuccess>
   | ReturnType<typeof receiveFormatFailure>
