@@ -41,38 +41,66 @@ const openWebSocket = (currentLocation: Location) => {
   }
 }
 
+// https://exponentialbackoffcalculator.com
+const backoffMs = (n: number) => Math.min(100 * Math.pow(2, n), 10000);
+
 export const websocketMiddleware = (window: Window): Middleware => store => {
-  const socket = openWebSocket(window.location);
+  let socket: WebSocket | null = null;
+  let wasConnected = false;
+  let reconnectAttempt = 0;
 
-  if (socket) {
-    socket.addEventListener('open', () => {
-      store.dispatch(websocketConnected());
-    });
+  const connect = () => {
+    socket = openWebSocket(window.location);
 
-    socket.addEventListener('close', () => {
-      store.dispatch(websocketDisconnected());
-    });
+    if (socket) {
+      socket.addEventListener('open', () => {
+        store.dispatch(websocketConnected());
 
-    socket.addEventListener('error', () => {
-      // We cannot get detailed information about the failure
-      // https://stackoverflow.com/a/31003057/155423
-      const error = 'Generic WebSocket Error';
-      store.dispatch(websocketError(error));
-      reportWebSocketError(error);
-    });
+        wasConnected = true;
+      });
 
-    // TODO: reconnect on error? (if ever connected? if < n failures?)
+      socket.addEventListener('close', (event) => {
+        store.dispatch(websocketDisconnected());
 
-    socket.addEventListener('message', (event) => {
-      try {
-        const rawMessage = JSON.parse(event.data);
-        const message = WSMessageResponse.parse(rawMessage);
-        store.dispatch(message);
-      } catch (e) {
-        console.log('Unable to parse WebSocket message', event.data, e);
-      }
-    });
-  }
+        // Reconnect if we've previously connected
+        if (wasConnected && !event.wasClean) {
+          wasConnected = false;
+          reconnectAttempt = 0;
+          reconnect();
+        }
+      });
+
+      socket.addEventListener('error', () => {
+        // We cannot get detailed information about the failure
+        // https://stackoverflow.com/a/31003057/155423
+        const error = 'Generic WebSocket Error';
+        store.dispatch(websocketError(error));
+        reportWebSocketError(error);
+      });
+
+      socket.addEventListener('message', (event) => {
+        try {
+          const rawMessage = JSON.parse(event.data);
+          const message = WSMessageResponse.parse(rawMessage);
+          store.dispatch(message);
+        } catch (e) {
+          console.log('Unable to parse WebSocket message', event.data, e);
+        }
+      });
+    }
+  };
+
+  const reconnect = () => {
+    if (socket && socket.readyState == socket.OPEN) { return; }
+
+    connect();
+
+    const delay = backoffMs(reconnectAttempt);
+    reconnectAttempt += 1;
+    setTimeout(reconnect, delay);
+  };
+
+  connect();
 
   return next => action => {
     if (socket && socket.readyState == socket.OPEN && sendActionOnWebsocket(action)) {
