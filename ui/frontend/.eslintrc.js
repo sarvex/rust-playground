@@ -64,6 +64,7 @@ module.exports = {
         '.eslintrc.js',
         'editor/AceEditor.tsx',
         'editor/SimpleEditor.tsx',
+        'reducers/output/gist.ts',
         'websocketMiddleware.ts',
       ],
       extends: ['prettier'],

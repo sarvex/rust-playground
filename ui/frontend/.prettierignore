@@ -13,4 +13,5 @@ node_modules
 !.eslintrc.js
 !editor/AceEditor.tsx
 !editor/SimpleEditor.tsx
+!reducers/output/gist.ts
 !websocketMiddleware.ts
