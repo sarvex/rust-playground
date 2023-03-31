@@ -509,7 +509,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compile_response() {
+    #[snafu::report]
+    async fn test_compile_response() -> super::Result<()> {
         let time_in_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap() // now can't be earlier than UNIX_EPOCH.
@@ -518,7 +519,7 @@ mod tests {
             .expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
-        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate().unwrap();
+        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate()?;
         playground_msg_tx
             .send(PlaygroundMessage::Request(
                 0,
@@ -556,10 +557,12 @@ mod tests {
         })
         .await
         .expect("Failed to receive response from container in time");
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_compile_streaming() {
+    #[snafu::report]
+    async fn test_compile_streaming() -> super::Result<()> {
         let time_in_nanos = SystemTime::now()
             .duration_since(SystemTime::UNIX_EPOCH)
             .unwrap() // now can't be earlier than UNIX_EPOCH.
@@ -568,7 +571,7 @@ mod tests {
             .expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
-        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate().unwrap();
+        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate()?;
         playground_msg_tx
             .send(PlaygroundMessage::Request(
                 0,
@@ -606,5 +609,6 @@ mod tests {
         })
         .await
         .expect("Failed to receive streaming from container in time");
+        Ok(())
     }
 }
