@@ -545,7 +545,7 @@ mod tests {
                         }
                     }
                 } else {
-                    panic!("Container message recevier ended unexpectedly");
+                    panic!("Container message receiver ended unexpectedly");
                 }
             }
         })
@@ -597,7 +597,7 @@ mod tests {
                         }
                     }
                 } else {
-                    panic!("Container message recevier ended unexpectedly");
+                    panic!("Container message receiver ended unexpectedly");
                 }
             }
         })
