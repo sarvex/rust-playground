@@ -3,13 +3,14 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
+    sync::Arc,
 };
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     select,
-    sync::{mpsc, oneshot},
+    sync::{mpsc, Notify},
     task::{JoinHandle, JoinSet},
 };
 
@@ -19,7 +20,7 @@ use crate::message::{
     WriteFileResponse,
 };
 
-type CommandRequest = (CommandId, ExecuteCommandRequest, oneshot::Sender<()>);
+type CommandRequest = (CommandId, ExecuteCommandRequest, Arc<Notify>);
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -38,9 +39,6 @@ pub enum Error {
     UnableToSendCommandExecutionRequest {
         source: mpsc::error::SendError<CommandRequest>,
     },
-
-    #[snafu(display("Failed to receiver command completion signal"))]
-    UnableToReceiveCommandCompletion { source: oneshot::error::RecvError },
 
     #[snafu(display("Failed to spawn child process"))]
     UnableToSpawnProcess { source: std::io::Error },
@@ -94,9 +92,6 @@ pub enum Error {
 
     #[snafu(display("Failed to wait for child process exiting"))]
     WaitChild { source: std::io::Error },
-
-    #[snafu(display("Failed to send command completion signal"))]
-    UnableToSendCommandCompletion,
 
     #[snafu(display("Failed to send coordinator message from deserialization task"))]
     UnableToSendCoordinatorMessage {
@@ -243,14 +238,12 @@ async fn handle_request(
             Ok(Response::ReadFile(ReadFileResponse(content)))
         }
         Request::ExecuteCommand(cmd) => {
-            let (response_tx, response_rx) = oneshot::channel();
+            let notify = Arc::new(Notify::new());
             cmd_tx
-                .send(((job_id, operation_id), cmd, response_tx))
+                .send(((job_id, operation_id), cmd, notify.clone()))
                 .await
                 .context(UnableToSendCommandExecutionRequestSnafu)?;
-            response_rx
-                .await
-                .context(UnableToReceiveCommandCompletionSnafu)?;
+            notify.notified().await;
             Ok(Response::ExecuteCommand(ExecuteCommandResponse(())))
         }
     }
@@ -291,7 +284,7 @@ async fn manage_processes(
                 let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id)?;
                 task_set.spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
-                    response_tx.send(()).ok().context(UnableToSendCommandCompletionSnafu)?;
+                    response_tx.notify_one();
                     Ok(())
                 });
                 processes.insert(cmd_id, task_set);
