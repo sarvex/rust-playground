@@ -67,7 +67,7 @@ impl Coordinator {
         if let Some(container) = self.free_containers.pop_front() {
             Ok(container)
         } else {
-            Ok(spawn_container(self.worker_project_dir.as_path())?)
+            spawn_container(self.worker_project_dir.as_path())
         }
     }
 }
