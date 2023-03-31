@@ -151,9 +151,6 @@ pub enum Error {
 
     #[snafu(display("RequestKind receiver ended unexpectedly"))]
     RequestKindReceiverEnded,
-
-    #[snafu(display("Worker's project directory path is not valid UTF-8"))]
-    WorkerProjectDirNotUTF8,
 }
 
 impl TryFrom<HighLevelRequest> for Job {
@@ -322,7 +319,7 @@ fn run_worker_in_background(project_dir: &Path) -> Result<(Child, ChildStdin, Ch
         // .arg("-i")
         // .args(["-a", "stdin", "-a", "stdout", "-a", "stderr"])
         // .arg("adwinw/rust-playground-worker")
-        .arg(project_dir.to_str().context(WorkerProjectDirNotUTF8Snafu)?)
+        .arg(project_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
