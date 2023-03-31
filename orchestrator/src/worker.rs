@@ -1,19 +1,17 @@
+use snafu::prelude::*;
 use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
 };
-
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     select,
     sync::{mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
-
-use snafu::prelude::*;
 
 use crate::message::{
     CommandId, CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, JobReport,
@@ -80,18 +78,6 @@ pub enum Error {
 
     #[snafu(display("Failed to read child process stderr"))]
     UnableToReadStderr { source: std::io::Error },
-
-    #[snafu(display("Failed to read u64 from stdin"))]
-    UnableToReadStdinPayloadLength { source: std::io::Error },
-
-    #[snafu(display("Failed to read payload from stdin"))]
-    UnableToReadStdinPayload { source: std::io::Error },
-
-    #[snafu(display("Failed to write u64 to stdout"))]
-    UnableToWriteStdoutPayloadLength { source: std::io::Error },
-
-    #[snafu(display("Failed to write payload to stdout"))]
-    UnableToWriteStdoutPayload { source: std::io::Error },
 
     #[snafu(display("Failed to flush stdout"))]
     UnableToFlushStdout { source: std::io::Error },
@@ -429,50 +415,38 @@ fn spawn_io_queue(
     coordinator_msg_tx: mpsc::Sender<CoordinatorMessage>,
     mut worker_msg_rx: mpsc::Receiver<WorkerMessage>,
 ) {
+    use std::io::{prelude::*, BufReader, BufWriter};
+
     tasks.spawn(async move {
-        let mut buffer = Vec::new();
-        let mut input_buf = BufReader::new(tokio::io::stdin());
-        loop {
-            let payload_len = input_buf
-                .read_u64()
-                .await
-                .context(UnableToReadStdinPayloadLengthSnafu)?;
-            while buffer.len() as u64 != payload_len {
-                (&mut input_buf)
-                    .take(payload_len - buffer.len() as u64)
-                    .read_to_end(&mut buffer)
-                    .await
-                    .context(UnableToReadStdinPayloadSnafu)?;
+        tokio::task::spawn_blocking(move || {
+            let stdin = std::io::stdin();
+            let mut stdin = BufReader::new(stdin);
+
+            loop {
+                let coordinator_msg = bincode::deserialize_from(&mut stdin)
+                    .context(UnableToDeserializeCoordinatorMessageSnafu)?;
+
+                coordinator_msg_tx
+                    .blocking_send(coordinator_msg)
+                    .context(UnableToSendCoordinatorMessageSnafu)?;
             }
-            let coordinator_msg: CoordinatorMessage = bincode::deserialize(&buffer)
-                .context(UnableToDeserializeCoordinatorMessageSnafu)?;
-            coordinator_msg_tx
-                .send(coordinator_msg)
-                .await
-                .context(UnableToSendCoordinatorMessageSnafu)?;
-            // Does not release memory in capacity.
-            buffer.clear();
-        }
+        }).await.unwrap(/* Panic occurred; re-raising */)
     });
 
     tasks.spawn(async move {
-        let mut output = tokio::io::stdout();
-        loop {
-            let worker_msg = worker_msg_rx
-                .recv()
-                .await
-                .context(UnableToReceiveWorkerMessageSnafu)?;
-            let encoded =
-                bincode::serialize(&worker_msg).context(UnableToSerializeWorkerMessageSnafu)?;
-            output
-                .write_u64(encoded.len() as u64)
-                .await
-                .context(UnableToWriteStdoutPayloadLengthSnafu)?;
-            output
-                .write_all(&encoded)
-                .await
-                .context(UnableToWriteStdoutPayloadSnafu)?;
-            output.flush().await.context(UnableToFlushStdoutSnafu)?;
-        }
+        tokio::task::spawn_blocking(move || {
+            let stdout = std::io::stdout();
+            let mut stdout = BufWriter::new(stdout);
+
+            loop {
+                let worker_msg = worker_msg_rx
+                    .blocking_recv()
+                    .context(UnableToReceiveWorkerMessageSnafu)?;
+
+                bincode::serialize_into(&mut stdout, &worker_msg).context(UnableToSerializeWorkerMessageSnafu)?;
+
+                stdout.flush().context(UnableToFlushStdoutSnafu)?;
+            }
+        }).await.unwrap(/* Panic occurred; re-raising */)
     });
 }
