@@ -300,7 +300,7 @@ async fn manage_processes(
                 let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id).await?;
                 task_set.spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
-                    response_tx.send(()).map_err(|_e| UnableToSendCommandCompletionSnafu.build())?;
+                    response_tx.send(()).ok().context(UnableToSendCommandCompletionSnafu)?;
                     Ok(())
                 });
                 processes.insert(cmd_id, task_set);
