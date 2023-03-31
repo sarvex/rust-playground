@@ -227,10 +227,7 @@ impl TryFrom<HighLevelRequest> for Job {
                 }
                 batch.push(Request::ExecuteCommand(ExecuteCommandRequest {
                     cmd: "cargo".to_owned(),
-                    args: args
-                        .into_iter()
-                        .map(|s| s.to_owned())
-                        .collect::<Vec<String>>(),
+                    args: args.into_iter().map(|s| s.to_owned()).collect(),
                     envs,
                     cwd: None,
                 }));

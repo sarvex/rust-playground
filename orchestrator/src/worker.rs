@@ -365,7 +365,7 @@ async fn stream_stdio(
                 break;
             }
         }
-        Ok::<(), Error>(())
+        Ok(())
     });
     let coordinator_tx_err = coordinator_tx;
     set.spawn(async move {
@@ -386,7 +386,7 @@ async fn stream_stdio(
                 break;
             }
         }
-        Ok::<(), Error>(())
+        Ok(())
     });
     Ok(set)
 }
