@@ -400,8 +400,13 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
         Ok(())
     });
     tokio::spawn(async move {
-        if (tasks.join_next().await).is_some() {
-            tasks.shutdown().await;
+        if let Some(task) = tasks.join_next().await {
+            eprintln!("{task:?}");
+
+            tasks.abort_all();
+            while let Some(task) = tasks.join_next().await {
+                eprintln!("{task:?}");
+            }
         }
     });
     Ok((child, playground_msg_tx, container_msg_rx))
