@@ -39,11 +39,6 @@ pub enum Error {
         source: mpsc::error::SendError<CommandRequest>,
     },
 
-    #[snafu(display("Failed to send stdin_sender"))]
-    UnableToSendStdinSender {
-        source: mpsc::error::SendError<(CommandId, mpsc::Sender<String>)>,
-    },
-
     #[snafu(display("Failed to receiver command completion signal"))]
     UnableToReceiveCommandCompletion { source: oneshot::error::RecvError },
 
@@ -130,9 +125,6 @@ pub enum Error {
 
     #[snafu(display("Stdin packet recevier ended unexpectedly"))]
     StdinReceiverEnded,
-
-    #[snafu(display("Receiver of stdin packet sender ended unexpectedly"))]
-    StdinSenderReceiverEnded,
 }
 
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
@@ -272,7 +264,6 @@ async fn manage_processes(
 ) -> Result<()> {
     let mut processes = HashMap::new();
     let mut stdin_senders: HashMap<(u64, u64), mpsc::Sender<String>> = HashMap::new();
-    let (stdin_sender_tx, mut stdin_sender_rx) = mpsc::channel(8);
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
@@ -295,7 +286,7 @@ async fn manage_processes(
 
                 // Preparing for receiving stdin packet.
                 let (stdin_tx, stdin_rx) = mpsc::channel(8);
-                stdin_sender_tx.send((cmd_id, stdin_tx)).await.context(UnableToSendStdinSenderSnafu)?;
+                stdin_senders.insert(cmd_id, stdin_tx);
 
                 let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id)?;
                 task_set.spawn(async move {
@@ -311,11 +302,6 @@ async fn manage_processes(
                 if let Some(stdin_tx) = stdin_senders.get(&cmd_id) {
                     stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
                 }
-            }
-            stdin_sender = stdin_sender_rx.recv() => {
-                // Store stdin packet senders so you can dispatch packet to them later.
-                let (cmd_id, stdin_tx) = stdin_sender.context(StdinSenderReceiverEndedSnafu)?;
-                stdin_senders.insert(cmd_id, stdin_tx);
             }
         }
     }
