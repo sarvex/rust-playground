@@ -416,30 +416,30 @@ async fn lower_operations(
     kind_tx: mpsc::Sender<(RequestId, RequestKind)>,
 ) -> Result<()> {
     loop {
-        if let Some(playground_msg) = playground_msg_rx.recv().await {
-            match playground_msg {
-                PlaygroundMessage::Request(id, req) => {
-                    let kind = RequestKind::kind(&req);
-                    kind_tx
-                        .send((id, kind))
-                        .await
-                        .context(UnableToSendRequestKindSnafu)?;
-                    let job = req.try_into()?;
-                    let coordinator_msg = CoordinatorMessage::Request(id, job);
-                    coordinator_msg_tx
-                        .send(coordinator_msg)
-                        .await
-                        .context(UnableToSendJobSnafu)?;
-                }
-                PlaygroundMessage::StdinPacket(cmd_id, data) => {
-                    coordinator_msg_tx
-                        .send(CoordinatorMessage::StdinPacket(cmd_id, data))
-                        .await
-                        .context(UnableToSendStdinPacketSnafu)?;
-                }
+        let playground_msg = playground_msg_rx
+            .recv()
+            .await
+            .context(PlaygroundMessageReceiverEndedSnafu)?;
+        match playground_msg {
+            PlaygroundMessage::Request(id, req) => {
+                let kind = RequestKind::kind(&req);
+                kind_tx
+                    .send((id, kind))
+                    .await
+                    .context(UnableToSendRequestKindSnafu)?;
+                let job = req.try_into()?;
+                let coordinator_msg = CoordinatorMessage::Request(id, job);
+                coordinator_msg_tx
+                    .send(coordinator_msg)
+                    .await
+                    .context(UnableToSendJobSnafu)?;
             }
-        } else {
-            return PlaygroundMessageReceiverEndedSnafu.fail();
+            PlaygroundMessage::StdinPacket(cmd_id, data) => {
+                coordinator_msg_tx
+                    .send(CoordinatorMessage::StdinPacket(cmd_id, data))
+                    .await
+                    .context(UnableToSendStdinPacketSnafu)?;
+            }
         }
     }
 }
@@ -453,32 +453,26 @@ async fn lift_operation_results(
     loop {
         select! {
             worker_msg = worker_msg_rx.recv() => {
-                if let Some(worker_msg) = worker_msg {
-                    match worker_msg {
-                        WorkerMessage::Response(id, job_report) => {
-                            if let Some(kind) = request_kinds.remove(&id) {
-                                let response = (job_report, kind).into();
-                                let container_msg = ContainerMessage::Response(id, response);
-                                container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
-                            }
-                        }
-                        WorkerMessage::StdoutPacket(cmd_id, data) => {
-                            container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
-                        }
-                        WorkerMessage::StderrPacket(cmd_id, data) => {
-                            container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
+                let worker_msg = worker_msg.context(WorkerMessageReceiverEndedSnafu)?;
+                match worker_msg {
+                    WorkerMessage::Response(id, job_report) => {
+                        if let Some(kind) = request_kinds.remove(&id) {
+                            let response = (job_report, kind).into();
+                            let container_msg = ContainerMessage::Response(id, response);
+                            container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
                         }
                     }
-                } else {
-                    return WorkerMessageReceiverEndedSnafu.fail();
+                    WorkerMessage::StdoutPacket(cmd_id, data) => {
+                        container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
+                    }
+                    WorkerMessage::StderrPacket(cmd_id, data) => {
+                        container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
+                    }
                 }
             }
             kind_msg = kind_rx.recv() => {
-                if let Some((id, kind)) = kind_msg {
-                    request_kinds.insert(id, kind);
-                } else {
-                    return RequestKindReceiverEndedSnafu.fail();
-                }
+                let (id, kind) = kind_msg.context(RequestKindReceiverEndedSnafu)?;
+                request_kinds.insert(id, kind);
             }
         }
     }

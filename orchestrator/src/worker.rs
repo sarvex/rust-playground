@@ -276,55 +276,46 @@ async fn manage_processes(
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
-                if let Some((cmd_id, req, response_tx)) = cmd_req {
-                    let ExecuteCommandRequest {
-                        cmd,
-                        args,
-                        envs,
-                        cwd,
-                    } = req;
-                    let mut child = Command::new(cmd)
-                        .args(args)
-                        .envs(envs)
-                        .current_dir(parse_working_dir(cwd, project_path.as_path()))
-                        .kill_on_drop(true)
-                        .stdin(Stdio::piped())
-                        .stdout(Stdio::piped())
-                        .stderr(Stdio::piped())
-                        .spawn().context(UnableToSpawnProcessSnafu)?;
+                let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+                let ExecuteCommandRequest {
+                    cmd,
+                    args,
+                    envs,
+                    cwd,
+                } = req;
+                let mut child = Command::new(cmd)
+                    .args(args)
+                    .envs(envs)
+                    .current_dir(parse_working_dir(cwd, project_path.as_path()))
+                    .kill_on_drop(true)
+                    .stdin(Stdio::piped())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn().context(UnableToSpawnProcessSnafu)?;
 
-                    // Preparing for receiving stdin packet.
-                    let (stdin_tx, stdin_rx) = mpsc::channel(8);
-                    stdin_sender_tx.send((cmd_id, stdin_tx)).await.context(UnableToSendStdinSenderSnafu)?;
+                // Preparing for receiving stdin packet.
+                let (stdin_tx, stdin_rx) = mpsc::channel(8);
+                stdin_sender_tx.send((cmd_id, stdin_tx)).await.context(UnableToSendStdinSenderSnafu)?;
 
-                    let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id).await?;
-                    task_set.spawn(async move {
-                        child.wait().await.context(WaitChildSnafu)?;
-                        response_tx.send(()).map_err(|_e| UnableToSendCommandCompletionSnafu.build())?;
-                        Ok(())
-                    });
-                    processes.insert(cmd_id, task_set);
-                } else {
-                    return CommandRequestReceiverEndedSnafu.fail();
-                }
+                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id).await?;
+                task_set.spawn(async move {
+                    child.wait().await.context(WaitChildSnafu)?;
+                    response_tx.send(()).map_err(|_e| UnableToSendCommandCompletionSnafu.build())?;
+                    Ok(())
+                });
+                processes.insert(cmd_id, task_set);
             }
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
-                if let Some((cmd_id, packet)) = stdin_packet {
-                    if let Some(stdin_tx) = stdin_senders.get(&cmd_id) {
-                        stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
-                    }
-                } else {
-                    return StdinReceiverEndedSnafu.fail();
+                let (cmd_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
+                if let Some(stdin_tx) = stdin_senders.get(&cmd_id) {
+                    stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
                 }
             }
             stdin_sender = stdin_sender_rx.recv() => {
                 // Store stdin packet senders so you can dispatch packet to them later.
-                if let Some((cmd_id, stdin_tx)) = stdin_sender {
-                    stdin_senders.insert(cmd_id, stdin_tx);
-                } else {
-                    return StdinSenderReceiverEndedSnafu.fail();
-                }
+                let (cmd_id, stdin_tx) = stdin_sender.context(StdinSenderReceiverEndedSnafu)?;
+                stdin_senders.insert(cmd_id, stdin_tx);
             }
         }
     }
@@ -336,18 +327,9 @@ async fn stream_stdio(
     child: &mut Child,
     cmd_id: CommandId,
 ) -> Result<JoinSet<Result<()>>> {
-    let mut stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| UnableToCaptureStdinSnafu.build())?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| UnableToCaptureStdoutSnafu.build())?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| UnableToCaptureStderrSnafu.build())?;
+    let mut stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
+    let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
+    let stderr = child.stderr.take().context(UnableToCaptureStderrSnafu)?;
 
     let mut set = JoinSet::new();
 
@@ -356,7 +338,7 @@ async fn stream_stdio(
             let data = stdin_rx
                 .recv()
                 .await
-                .ok_or_else(|| UnableToReceiveStdinDataSnafu.build())?;
+                .context(UnableToReceiveStdinDataSnafu)?;
             stdin
                 .write_all(data.as_bytes())
                 .await
