@@ -297,7 +297,7 @@ async fn manage_processes(
                 let (stdin_tx, stdin_rx) = mpsc::channel(8);
                 stdin_sender_tx.send((cmd_id, stdin_tx)).await.context(UnableToSendStdinSenderSnafu)?;
 
-                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id).await?;
+                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id)?;
                 task_set.spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
                     response_tx.send(()).ok().context(UnableToSendCommandCompletionSnafu)?;
@@ -321,7 +321,7 @@ async fn manage_processes(
     }
 }
 
-async fn stream_stdio(
+fn stream_stdio(
     coordinator_tx: mpsc::Sender<WorkerMessage>,
     mut stdin_rx: mpsc::Receiver<String>,
     child: &mut Child,
