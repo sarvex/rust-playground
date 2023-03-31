@@ -19,11 +19,12 @@ use crate::{
     sandbox::{CompileRequest, CompileResponse},
 };
 
-pub type Container = (
-    Child,
-    mpsc::Sender<PlaygroundMessage>,
-    mpsc::Receiver<ContainerMessage>,
-);
+#[derive(Debug)]
+pub struct Container {
+    child: Child,
+    tx: mpsc::Sender<PlaygroundMessage>,
+    rx: mpsc::Receiver<ContainerMessage>,
+}
 pub type RequestId = u64;
 
 #[derive(Debug)]
@@ -406,7 +407,11 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
             }
         }
     });
-    Ok((child, playground_msg_tx, container_msg_rx))
+    Ok(Container {
+        child,
+        tx: playground_msg_tx,
+        rx: container_msg_rx,
+    })
 }
 
 async fn lower_operations(
