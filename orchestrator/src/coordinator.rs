@@ -4,14 +4,17 @@ use std::{
     convert::{TryFrom, TryInto},
     path::{Path, PathBuf},
     process::Stdio,
-    str::from_utf8, sync::atomic::{AtomicU64, Ordering},
+    str::from_utf8,
+    sync::atomic::{AtomicU64, Ordering},
 };
 use tokio::{
+    join,
     process::{Child, ChildStdin, ChildStdout, Command},
     select,
-    sync::{mpsc, oneshot},
-    task::{JoinSet, JoinHandle},
+    sync::mpsc,
+    task::{JoinHandle, JoinSet},
 };
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::io::SyncIoBridge;
 
 use crate::{
@@ -33,7 +36,10 @@ pub struct Container {
 }
 
 impl Container {
-    async fn fanout(mut command_rx: mpsc::Receiver<FanoutCommand>, mut rx: mpsc::Receiver<ContainerMessage>) {
+    async fn fanout(
+        mut command_rx: mpsc::Receiver<FanoutCommand>,
+        mut rx: mpsc::Receiver<ContainerMessage>,
+    ) {
         let mut waiting = HashMap::new();
 
         loop {
@@ -61,38 +67,49 @@ impl Container {
     }
 
     pub async fn compile(&self, request: CompileRequest) -> Result<CompileResponse> {
-        let (mut result, mut stdout, mut stderr) = self.begin_compile(request).await?;
+        let (result, stdout, stderr) = self.begin_compile(request).await?;
 
-        let mut stdout_buf = String::new();
-        let mut stderr_buf = String::new();
+        let stdout = ReceiverStream::new(stdout).collect();
+        let stderr = ReceiverStream::new(stderr).collect();
 
-        loop {
-            select! {
-                result = &mut result => {
-                    let mut result = result.expect("handle me")?;
-                    result.stdout = stdout_buf;
-                    result.stderr = stderr_buf;
-                    return Ok(result);
-                },
+        let (result, stdout, stderr) = join!(result, stdout, stderr);
 
-                Some(stdout) = stdout.recv() => stdout_buf.push_str(&stdout),
-                Some(stderr) = stderr.recv() => stderr_buf.push_str(&stderr),
-            }
-        }
+        let mut result = result.expect("handle me")?;
+        result.stdout = stdout;
+        result.stderr = stderr;
+
+        Ok(result)
     }
 
-    pub async fn begin_compile(&self, request: CompileRequest) -> Result<(
+    pub async fn begin_compile(
+        &self,
+        request: CompileRequest,
+    ) -> Result<(
         JoinHandle<Result<CompileResponse>>, // TODO: shouldn't include stdout / stderr
         mpsc::Receiver<String>,
         mpsc::Receiver<String>,
     )> {
-        let Self { child, tx: to_worker_tx, command_tx, id } = self;
+        let Self {
+            tx: to_worker_tx,
+            command_tx,
+            id,
+            ..
+        } = self;
         let id = id.fetch_add(1, Ordering::SeqCst);
 
         let (from_worker_tx, mut from_worker_rx) = mpsc::channel(8);
 
-        command_tx.send(FanoutCommand::Listen(id, from_worker_tx)).await.unwrap();
-        to_worker_tx.send(PlaygroundMessage::Request(id, HighLevelRequest::Compile(request))).await.expect("handle this");
+        command_tx
+            .send(FanoutCommand::Listen(id, from_worker_tx))
+            .await
+            .unwrap();
+        to_worker_tx
+            .send(PlaygroundMessage::Request(
+                id,
+                HighLevelRequest::Compile(request),
+            ))
+            .await
+            .expect("handle this");
 
         let (stdout_tx, stdout_rx) = mpsc::channel(8);
         let (stderr_tx, stderr_rx) = mpsc::channel(8);
@@ -100,17 +117,15 @@ impl Container {
         let x = tokio::spawn(async move {
             while let Some(container_msg) = from_worker_rx.recv().await {
                 match container_msg {
-                    ContainerMessage::Response(_, resp) => {
-                        match resp {
-                            HighLevelResponse::Compile(resp) => return Ok(resp),
-                        }
-                    }
+                    ContainerMessage::Response(_, resp) => match resp {
+                        HighLevelResponse::Compile(resp) => return Ok(resp),
+                    },
                     ContainerMessage::StdoutPacket(_, packet) => {
                         stdout_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
-                    },
+                    }
                     ContainerMessage::StderrPacket(_, packet) => {
                         stderr_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
-                    },
+                    }
                 }
             }
 
@@ -588,11 +603,12 @@ async fn lift_operation_results(
 #[cfg(test)]
 mod tests {
     use std::time::{Duration, SystemTime};
-
     use tempdir::TempDir;
+    use tokio::join;
+    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
     use crate::{
-        coordinator::{ContainerMessage, Coordinator, HighLevelResponse, PlaygroundMessage},
+        coordinator::Coordinator,
         sandbox::{Channel, CompileRequest, CompileTarget, CrateType, Edition, Mode},
     };
 
@@ -623,7 +639,10 @@ mod tests {
         let container = coordinator.allocate()?;
         let response = tokio::time::timeout(
             Duration::from_millis(5000),
-            container.compile(new_compile_request())).await.expect("Timed out")?;
+            container.compile(new_compile_request()),
+        )
+        .await
+        .expect("Failed to receive streaming from container in time")?;
 
         assert!(response.success);
 
@@ -633,52 +652,33 @@ mod tests {
     #[tokio::test]
     #[snafu::report]
     async fn test_compile_streaming() -> super::Result<()> {
-        // let time_in_nanos = SystemTime::now()
-        //     .duration_since(SystemTime::UNIX_EPOCH)
-        //     .unwrap() // now can't be earlier than UNIX_EPOCH.
-        //     .as_nanos();
-        // let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
-        //     .expect("Failed to create temporary project directory");
-        // let mut coordinator = Coordinator::new(project_dir.path());
+        let time_in_nanos = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap() // now can't be earlier than UNIX_EPOCH.
+            .as_nanos();
+        let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
+            .expect("Failed to create temporary project directory");
+        let mut coordinator = Coordinator::new(project_dir.path());
 
-        // let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate()?;
-        // playground_msg_tx
-        //     .send(PlaygroundMessage::Request(
-        //         0,
-        //         super::HighLevelRequest::Compile(new_compile_request()),
-        //     ))
-        //     .await
-        //     .unwrap();
+        let container = coordinator.allocate()?;
+        let (complete, stdout, stderr) = container.begin_compile(new_compile_request()).await?;
 
-        // tokio::time::timeout(Duration::from_millis(5000), async move {
-        //     let mut stderr = String::new();
-        //     loop {
-        //         if let Some(container_msg) = container_msg_rx.recv().await {
-        //             match container_msg {
-        //                 ContainerMessage::Response(_id, resp) => match resp {
-        //                     HighLevelResponse::Compile(resp) => {
-        //                         println!("{}", resp.code);
-        //                     }
-        //                 },
-        //                 ContainerMessage::StdoutPacket(_, packet) => {
-        //                     println!("Stdout: {packet}");
-        //                 }
-        //                 ContainerMessage::StderrPacket(_, packet) => {
-        //                     println!("Stderr: {packet}");
-        //                     stderr.push_str(&packet);
-        //                     if stderr.contains("Compiling") && stderr.contains("Finished") {
-        //                         // Correct output.
-        //                         break;
-        //                     }
-        //                 }
-        //             }
-        //         } else {
-        //             panic!("Container message receiver ended unexpectedly");
-        //         }
-        //     }
-        // })
-        // .await
-        // .expect("Failed to receive streaming from container in time");
+        let stdout = ReceiverStream::new(stdout);
+        let stdout = stdout.collect::<String>();
+
+        let stderr = ReceiverStream::new(stderr);
+        let stderr = stderr.collect::<String>();
+
+        let (_complete, _stdout, stderr) =
+            tokio::time::timeout(Duration::from_millis(5000), async move {
+                join!(complete, stdout, stderr)
+            })
+            .await
+            .expect("Failed to receive streaming from container in time");
+
+        assert!(stderr.contains("Compiling"));
+        assert!(stderr.contains("Finished"));
+
         Ok(())
     }
 }
