@@ -602,7 +602,7 @@ async fn lift_operation_results(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
+    use std::time::Duration;
     use tempdir::TempDir;
     use tokio::join;
     use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -628,12 +628,8 @@ mod tests {
     #[tokio::test]
     #[snafu::report]
     async fn test_compile_response() -> super::Result<()> {
-        let time_in_nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // now can't be earlier than UNIX_EPOCH.
-            .as_nanos();
-        let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
-            .expect("Failed to create temporary project directory");
+        let project_dir =
+            TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
         let container = coordinator.allocate()?;
@@ -652,12 +648,8 @@ mod tests {
     #[tokio::test]
     #[snafu::report]
     async fn test_compile_streaming() -> super::Result<()> {
-        let time_in_nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // now can't be earlier than UNIX_EPOCH.
-            .as_nanos();
-        let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
-            .expect("Failed to create temporary project directory");
+        let project_dir =
+            TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
         let container = coordinator.allocate()?;
