@@ -1,30 +1,143 @@
+use snafu::prelude::*;
 use std::{
     collections::{HashMap, VecDeque},
     convert::{TryFrom, TryInto},
     path::{Path, PathBuf},
     process::Stdio,
     str::from_utf8,
+    sync::atomic::{AtomicU64, Ordering},
 };
-
-use snafu::prelude::*;
 use tokio::{
-    io::{AsyncReadExt, AsyncWriteExt, BufReader},
+    join,
     process::{Child, ChildStdin, ChildStdout, Command},
     select,
     sync::mpsc,
-    task::JoinSet,
+    task::{JoinHandle, JoinSet},
 };
+use tokio_stream::{wrappers::ReceiverStream, StreamExt};
+use tokio_util::io::SyncIoBridge;
 
 use crate::{
     message::{CommandId, CoordinatorMessage, Job, JobReport, WorkerMessage},
     sandbox::{CompileRequest, CompileResponse},
 };
 
-pub type Container = (
-    Child,
-    mpsc::Sender<PlaygroundMessage>,
-    mpsc::Receiver<ContainerMessage>,
-);
+#[derive(Debug)]
+enum FanoutCommand {
+    Listen(u64, mpsc::Sender<ContainerMessage>),
+}
+
+#[derive(Debug)]
+pub struct Container {
+    child: Child,
+    tx: mpsc::Sender<PlaygroundMessage>,
+    command_tx: mpsc::Sender<FanoutCommand>,
+    id: AtomicU64,
+}
+
+impl Container {
+    async fn fanout(
+        mut command_rx: mpsc::Receiver<FanoutCommand>,
+        mut rx: mpsc::Receiver<ContainerMessage>,
+    ) {
+        let mut waiting = HashMap::new();
+
+        loop {
+            select! {
+                command = command_rx.recv() => {
+                    let command = command.expect("Handle this");
+                    match command {
+                        FanoutCommand::Listen(id, waiter) => {
+                            waiting.insert(id, waiter);
+                            // TODO: ensure not replacing
+                        }
+                    }
+                },
+
+                msg = rx.recv() => {
+                    let msg = msg.expect("Handle this");
+                    let id = 0; // TODO: some uniform way of getting the ID for _any_ message
+                    if let Some(waiter) = waiting.get(&id) {
+                        waiter.send(msg).await.ok(/* Don't care about it */);
+                    }
+                    // TODO: log unattended messages?
+                }
+            }
+        }
+    }
+
+    pub async fn compile(&self, request: CompileRequest) -> Result<CompileResponse> {
+        let (result, stdout, stderr) = self.begin_compile(request).await?;
+
+        let stdout = ReceiverStream::new(stdout).collect();
+        let stderr = ReceiverStream::new(stderr).collect();
+
+        let (result, stdout, stderr) = join!(result, stdout, stderr);
+
+        let mut result = result.expect("handle me")?;
+        result.stdout = stdout;
+        result.stderr = stderr;
+
+        Ok(result)
+    }
+
+    pub async fn begin_compile(
+        &self,
+        request: CompileRequest,
+    ) -> Result<(
+        JoinHandle<Result<CompileResponse>>, // TODO: shouldn't include stdout / stderr
+        mpsc::Receiver<String>,
+        mpsc::Receiver<String>,
+    )> {
+        let Self {
+            tx: to_worker_tx,
+            command_tx,
+            id,
+            ..
+        } = self;
+        let id = id.fetch_add(1, Ordering::SeqCst);
+
+        let (from_worker_tx, mut from_worker_rx) = mpsc::channel(8);
+
+        command_tx
+            .send(FanoutCommand::Listen(id, from_worker_tx))
+            .await
+            .unwrap();
+        to_worker_tx
+            .send(PlaygroundMessage::Request(
+                id,
+                HighLevelRequest::Compile(request),
+            ))
+            .await
+            .expect("handle this");
+
+        let (stdout_tx, stdout_rx) = mpsc::channel(8);
+        let (stderr_tx, stderr_rx) = mpsc::channel(8);
+
+        let x = tokio::spawn(async move {
+            while let Some(container_msg) = from_worker_rx.recv().await {
+                match container_msg {
+                    ContainerMessage::Response(_, resp) => match resp {
+                        HighLevelResponse::Compile(resp) => return Ok(resp),
+                    },
+                    ContainerMessage::StdoutPacket(_, packet) => {
+                        stdout_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
+                    }
+                    ContainerMessage::StderrPacket(_, packet) => {
+                        stderr_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
+                    }
+                }
+            }
+
+            // TODO: Stop listening
+
+            panic!("Shouldn't have ended yet");
+        });
+
+        Ok((x, stdout_rx, stderr_rx))
+    }
+}
+
 pub type RequestId = u64;
 
 #[derive(Debug)]
@@ -68,7 +181,7 @@ impl Coordinator {
         if let Some(container) = self.free_containers.pop_front() {
             Ok(container)
         } else {
-            Ok(spawn_container(self.worker_project_dir.as_path())?)
+            spawn_container(self.worker_project_dir.as_path())
         }
     }
 }
@@ -86,14 +199,8 @@ pub enum Error {
     #[snafu(display("Worker process's stdout not captured"))]
     WorkerStdoutCapture,
 
-    #[snafu(display("Failed to read u64 from child stdout"))]
-    UnableToReadStdoutPayloadLength { source: std::io::Error },
-
-    #[snafu(display("Failed to read child stdout payload"))]
-    UnableToReadStdoutPayload { source: std::io::Error },
-
-    #[snafu(display("Failed to write to child stdin"))]
-    WorkerStdinWrite { source: std::io::Error },
+    #[snafu(display("Failed to flush child stdin"))]
+    WorkerStdinFlush { source: std::io::Error },
 
     #[snafu(display("Failed to deserialize worker message"))]
     WorkerMessageDeserialization { source: bincode::Error },
@@ -158,9 +265,6 @@ pub enum Error {
 
     #[snafu(display("RequestKind receiver ended unexpectedly"))]
     RequestKindReceiverEnded,
-
-    #[snafu(display("Worker's project directory path is not valid UTF-8"))]
-    WorkerProjectDirNotUTF8,
 }
 
 impl TryFrom<HighLevelRequest> for Job {
@@ -234,10 +338,7 @@ impl TryFrom<HighLevelRequest> for Job {
                 }
                 batch.push(Request::ExecuteCommand(ExecuteCommandRequest {
                     cmd: "cargo".to_owned(),
-                    args: args
-                        .into_iter()
-                        .map(|s| s.to_owned())
-                        .collect::<Vec<String>>(),
+                    args: args.into_iter().map(|s| s.to_owned()).collect(),
                     envs,
                     cwd: None,
                 }));
@@ -332,7 +433,7 @@ fn run_worker_in_background(project_dir: &Path) -> Result<(Child, ChildStdin, Ch
         // .arg("-i")
         // .args(["-a", "stdin", "-a", "stdout", "-a", "stderr"])
         // .arg("adwinw/rust-playground-worker")
-        .arg(project_dir.to_str().context(WorkerProjectDirNotUTF8Snafu)?)
+        .arg(project_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
@@ -345,56 +446,51 @@ fn run_worker_in_background(project_dir: &Path) -> Result<(Child, ChildStdin, Ch
 // Child stdin/out <--> messages.
 fn spawn_io_queue(
     tasks: &mut JoinSet<Result<()>>,
-    mut stdin: ChildStdin,
+    stdin: ChildStdin,
     stdout: ChildStdout,
 ) -> (
     mpsc::Sender<CoordinatorMessage>,
     mpsc::Receiver<WorkerMessage>,
 ) {
+    use std::io::{prelude::*, BufReader, BufWriter};
+
     let (tx, worker_msg_rx) = mpsc::channel(8);
     tasks.spawn(async move {
-        let mut buffer = Vec::new();
-        let mut stdout_buf = BufReader::new(stdout);
-        loop {
-            let payload_len = stdout_buf
-                .read_u64()
-                .await
-                .context(UnableToReadStdoutPayloadLengthSnafu)?;
-            while buffer.len() as u64 != payload_len {
-                (&mut stdout_buf)
-                    .take(payload_len - buffer.len() as u64)
-                    .read_to_end(&mut buffer)
-                    .await
-                    .context(UnableToReadStdoutPayloadSnafu)?;
+        tokio::task::spawn_blocking(move || {
+            let stdout = SyncIoBridge::new(stdout);
+            let mut stdout = BufReader::new(stdout);
+
+            loop {
+                let worker_msg = bincode::deserialize_from(&mut stdout)
+                    .context(WorkerMessageDeserializationSnafu)?;
+
+                tx.blocking_send(worker_msg)
+                    .context(UnableToSendWorkerMessageSnafu)?;
             }
-            let worker_msg: WorkerMessage =
-                bincode::deserialize(&buffer).context(WorkerMessageDeserializationSnafu)?;
-            tx.send(worker_msg)
-                .await
-                .context(UnableToSendWorkerMessageSnafu)?;
-            // Does not release memory in capacity.
-            buffer.clear();
-        }
+        })
+        .await
+        .unwrap(/* Panic occurred; re-raising */)
     });
+
     let (coordinator_msg_tx, mut rx) = mpsc::channel(8);
     tasks.spawn(async move {
-        loop {
-            let coordinator_msg = rx
-                .recv()
-                .await
-                .context(UnableToReceiveCoordinatorMessageSnafu)?;
-            let encoded = bincode::serialize(&coordinator_msg)
-                .context(CoordinatorMessageSerializationSnafu)?;
-            stdin
-                .write_u64(encoded.len() as u64)
-                .await
-                .context(WorkerStdinWriteSnafu)?;
-            stdin
-                .write_all(&encoded)
-                .await
-                .context(WorkerStdinWriteSnafu)?;
-            stdin.flush().await.context(WorkerStdinWriteSnafu)?;
-        }
+        tokio::task::spawn_blocking(move || {
+            let stdin = SyncIoBridge::new(stdin);
+            let mut stdin = BufWriter::new(stdin);
+
+            loop {
+                let coordinator_msg = rx
+                    .blocking_recv()
+                    .context(UnableToReceiveCoordinatorMessageSnafu)?;
+
+                bincode::serialize_into(&mut stdin, &coordinator_msg)
+                    .context(CoordinatorMessageSerializationSnafu)?;
+
+                stdin.flush().context(WorkerStdinFlushSnafu)?;
+            }
+        })
+        .await
+        .unwrap(/* Panic occurred; re-raising */)
     });
     (coordinator_msg_tx, worker_msg_rx)
 }
@@ -415,11 +511,25 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
         Ok(())
     });
     tokio::spawn(async move {
-        if (tasks.join_next().await).is_some() {
-            tasks.shutdown().await;
+        if let Some(task) = tasks.join_next().await {
+            eprintln!("{task:?}");
+
+            tasks.abort_all();
+            while let Some(task) = tasks.join_next().await {
+                eprintln!("{task:?}");
+            }
         }
     });
-    Ok((child, playground_msg_tx, container_msg_rx))
+
+    let (command_tx, command_rx) = mpsc::channel(8);
+    tokio::spawn(Container::fanout(command_rx, container_msg_rx));
+
+    Ok(Container {
+        child,
+        tx: playground_msg_tx,
+        command_tx,
+        id: AtomicU64::new(0),
+    })
 }
 
 async fn lower_operations(
@@ -428,30 +538,30 @@ async fn lower_operations(
     kind_tx: mpsc::Sender<(RequestId, RequestKind)>,
 ) -> Result<()> {
     loop {
-        if let Some(playground_msg) = playground_msg_rx.recv().await {
-            match playground_msg {
-                PlaygroundMessage::Request(id, req) => {
-                    let kind = RequestKind::kind(&req);
-                    kind_tx
-                        .send((id, kind))
-                        .await
-                        .context(UnableToSendRequestKindSnafu)?;
-                    let job = req.try_into()?;
-                    let coordinator_msg = CoordinatorMessage::Request(id, job);
-                    coordinator_msg_tx
-                        .send(coordinator_msg)
-                        .await
-                        .context(UnableToSendJobSnafu)?;
-                }
-                PlaygroundMessage::StdinPacket(cmd_id, data) => {
-                    coordinator_msg_tx
-                        .send(CoordinatorMessage::StdinPacket(cmd_id, data))
-                        .await
-                        .context(UnableToSendStdinPacketSnafu)?;
-                }
+        let playground_msg = playground_msg_rx
+            .recv()
+            .await
+            .context(PlaygroundMessageReceiverEndedSnafu)?;
+        match playground_msg {
+            PlaygroundMessage::Request(id, req) => {
+                let kind = RequestKind::kind(&req);
+                kind_tx
+                    .send((id, kind))
+                    .await
+                    .context(UnableToSendRequestKindSnafu)?;
+                let job = req.try_into()?;
+                let coordinator_msg = CoordinatorMessage::Request(id, job);
+                coordinator_msg_tx
+                    .send(coordinator_msg)
+                    .await
+                    .context(UnableToSendJobSnafu)?;
             }
-        } else {
-            return PlaygroundMessageReceiverEndedSnafu.fail();
+            PlaygroundMessage::StdinPacket(cmd_id, data) => {
+                coordinator_msg_tx
+                    .send(CoordinatorMessage::StdinPacket(cmd_id, data))
+                    .await
+                    .context(UnableToSendStdinPacketSnafu)?;
+            }
         }
     }
 }
@@ -465,32 +575,26 @@ async fn lift_operation_results(
     loop {
         select! {
             worker_msg = worker_msg_rx.recv() => {
-                if let Some(worker_msg) = worker_msg {
-                    match worker_msg {
-                        WorkerMessage::Response(id, job_report) => {
-                            if let Some(kind) = request_kinds.remove(&id) {
-                                let response = (job_report, kind).into();
-                                let container_msg = ContainerMessage::Response(id, response);
-                                container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
-                            }
-                        }
-                        WorkerMessage::StdoutPacket(cmd_id, data) => {
-                            container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
-                        }
-                        WorkerMessage::StderrPacket(cmd_id, data) => {
-                            container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
+                let worker_msg = worker_msg.context(WorkerMessageReceiverEndedSnafu)?;
+                match worker_msg {
+                    WorkerMessage::Response(id, job_report) => {
+                        if let Some(kind) = request_kinds.remove(&id) {
+                            let response = (job_report, kind).into();
+                            let container_msg = ContainerMessage::Response(id, response);
+                            container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
                         }
                     }
-                } else {
-                    return WorkerMessageReceiverEndedSnafu.fail();
+                    WorkerMessage::StdoutPacket(cmd_id, data) => {
+                        container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
+                    }
+                    WorkerMessage::StderrPacket(cmd_id, data) => {
+                        container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
+                    }
                 }
             }
             kind_msg = kind_rx.recv() => {
-                if let Some((id, kind)) = kind_msg {
-                    request_kinds.insert(id, kind);
-                } else {
-                    return RequestKindReceiverEndedSnafu.fail();
-                }
+                let (id, kind) = kind_msg.context(RequestKindReceiverEndedSnafu)?;
+                request_kinds.insert(id, kind);
             }
         }
     }
@@ -498,12 +602,13 @@ async fn lift_operation_results(
 
 #[cfg(test)]
 mod tests {
-    use std::time::{Duration, SystemTime};
-
+    use std::time::Duration;
     use tempdir::TempDir;
+    use tokio::join;
+    use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 
     use crate::{
-        coordinator::{ContainerMessage, Coordinator, HighLevelResponse, PlaygroundMessage},
+        coordinator::Coordinator,
         sandbox::{Channel, CompileRequest, CompileTarget, CrateType, Edition, Mode},
     };
 
@@ -521,102 +626,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_compile_response() {
-        let time_in_nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // now can't be earlier than UNIX_EPOCH.
-            .as_nanos();
-        let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
-            .expect("Failed to create temporary project directory");
+    #[snafu::report]
+    async fn test_compile_response() -> super::Result<()> {
+        let project_dir =
+            TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
-        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate().unwrap();
-        playground_msg_tx
-            .send(PlaygroundMessage::Request(
-                0,
-                super::HighLevelRequest::Compile(new_compile_request()),
-            ))
-            .await
-            .unwrap();
-
-        tokio::time::timeout(Duration::from_millis(5000), async move {
-            loop {
-                if let Some(container_msg) = container_msg_rx.recv().await {
-                    match container_msg {
-                        ContainerMessage::Response(id, resp) => {
-                            if id == 0 {
-                                match resp {
-                                    HighLevelResponse::Compile(resp) => {
-                                        println!("{}", resp.code);
-                                        assert!(resp.success);
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                        ContainerMessage::StdoutPacket(_, packet) => {
-                            println!("Stdout: {packet}");
-                        }
-                        ContainerMessage::StderrPacket(_, packet) => {
-                            println!("Stderr: {packet}");
-                        }
-                    }
-                } else {
-                    panic!("Container message recevier ended unexpectedly");
-                }
-            }
-        })
+        let container = coordinator.allocate()?;
+        let response = tokio::time::timeout(
+            Duration::from_millis(5000),
+            container.compile(new_compile_request()),
+        )
         .await
-        .expect("Failed to receive response from container in time");
+        .expect("Failed to receive streaming from container in time")?;
+
+        assert!(response.success);
+
+        Ok(())
     }
 
     #[tokio::test]
-    async fn test_compile_streaming() {
-        let time_in_nanos = SystemTime::now()
-            .duration_since(SystemTime::UNIX_EPOCH)
-            .unwrap() // now can't be earlier than UNIX_EPOCH.
-            .as_nanos();
-        let project_dir = TempDir::new(&format!("playground-{time_in_nanos}"))
-            .expect("Failed to create temporary project directory");
+    #[snafu::report]
+    async fn test_compile_streaming() -> super::Result<()> {
+        let project_dir =
+            TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
-        let (_child, playground_msg_tx, mut container_msg_rx) = coordinator.allocate().unwrap();
-        playground_msg_tx
-            .send(PlaygroundMessage::Request(
-                0,
-                super::HighLevelRequest::Compile(new_compile_request()),
-            ))
-            .await
-            .unwrap();
+        let container = coordinator.allocate()?;
+        let (complete, stdout, stderr) = container.begin_compile(new_compile_request()).await?;
 
-        tokio::time::timeout(Duration::from_millis(5000), async move {
-            let mut stderr = String::new();
-            loop {
-                if let Some(container_msg) = container_msg_rx.recv().await {
-                    match container_msg {
-                        ContainerMessage::Response(_id, resp) => match resp {
-                            HighLevelResponse::Compile(resp) => {
-                                println!("{}", resp.code);
-                            }
-                        },
-                        ContainerMessage::StdoutPacket(_, packet) => {
-                            println!("Stdout: {packet}");
-                        }
-                        ContainerMessage::StderrPacket(_, packet) => {
-                            println!("Stderr: {packet}");
-                            stderr.push_str(&packet);
-                            if stderr.contains("Compiling") && stderr.contains("Finished") {
-                                // Correct output.
-                                break;
-                            }
-                        }
-                    }
-                } else {
-                    panic!("Container message recevier ended unexpectedly");
-                }
-            }
-        })
-        .await
-        .expect("Failed to receive streaming from container in time");
+        let stdout = ReceiverStream::new(stdout);
+        let stdout = stdout.collect::<String>();
+
+        let stderr = ReceiverStream::new(stderr);
+        let stderr = stderr.collect::<String>();
+
+        let (_complete, _stdout, stderr) =
+            tokio::time::timeout(Duration::from_millis(5000), async move {
+                join!(complete, stdout, stderr)
+            })
+            .await
+            .expect("Failed to receive streaming from container in time");
+
+        assert!(stderr.contains("Compiling"));
+        assert!(stderr.contains("Finished"));
+
+        Ok(())
     }
 }
