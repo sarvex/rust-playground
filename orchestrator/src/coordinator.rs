@@ -1,71 +1,44 @@
 use snafu::prelude::*;
 use std::{
     collections::{HashMap, VecDeque},
-    convert::{TryFrom, TryInto},
     path::{Path, PathBuf},
     process::Stdio,
-    str::from_utf8,
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
 };
 use tokio::{
     join,
     process::{Child, ChildStdin, ChildStdout, Command},
     select,
-    sync::mpsc,
+    sync::{mpsc, oneshot},
     task::{JoinHandle, JoinSet},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::io::SyncIoBridge;
 
 use crate::{
-    message::{CommandId, CoordinatorMessage, Job, JobReport, WorkerMessage},
-    sandbox::{CompileRequest, CompileResponse},
+    message::{
+        CoordinatorMessage, JobId, Multiplexed, OneToOneResponse, ReadFileResponse, WorkerMessage,
+        WriteFileRequest,
+    },
+    sandbox::{CompileRequest, CompileResponse, CompileResponse2},
 };
 
 #[derive(Debug)]
-enum FanoutCommand {
-    Listen(u64, mpsc::Sender<ContainerMessage>),
+enum DemultiplexCommand {
+    Listen(JobId, mpsc::Sender<WorkerMessage>),
+    ListenOnce(JobId, oneshot::Sender<WorkerMessage>),
 }
 
 #[derive(Debug)]
 pub struct Container {
     child: Child,
-    tx: mpsc::Sender<PlaygroundMessage>,
-    command_tx: mpsc::Sender<FanoutCommand>,
-    id: AtomicU64,
+    commander: Commander,
 }
 
 impl Container {
-    async fn fanout(
-        mut command_rx: mpsc::Receiver<FanoutCommand>,
-        mut rx: mpsc::Receiver<ContainerMessage>,
-    ) {
-        let mut waiting = HashMap::new();
-
-        loop {
-            select! {
-                command = command_rx.recv() => {
-                    let command = command.expect("Handle this");
-                    match command {
-                        FanoutCommand::Listen(id, waiter) => {
-                            waiting.insert(id, waiter);
-                            // TODO: ensure not replacing
-                        }
-                    }
-                },
-
-                msg = rx.recv() => {
-                    let msg = msg.expect("Handle this");
-                    let id = 0; // TODO: some uniform way of getting the ID for _any_ message
-                    if let Some(waiter) = waiting.get(&id) {
-                        waiter.send(msg).await.ok(/* Don't care about it */);
-                    }
-                    // TODO: log unattended messages?
-                }
-            }
-        }
-    }
-
     pub async fn compile(&self, request: CompileRequest) -> Result<CompileResponse> {
         let (result, stdout, stderr) = self.begin_compile(request).await?;
 
@@ -74,93 +47,249 @@ impl Container {
 
         let (result, stdout, stderr) = join!(result, stdout, stderr);
 
-        let mut result = result.expect("handle me")?;
-        result.stdout = stdout;
-        result.stderr = stderr;
-
-        Ok(result)
+        let CompileResponse2 { success, code } = result.expect("handle me")?;
+        Ok(CompileResponse {
+            success,
+            code,
+            stdout,
+            stderr,
+        })
     }
 
     pub async fn begin_compile(
         &self,
         request: CompileRequest,
     ) -> Result<(
-        JoinHandle<Result<CompileResponse>>, // TODO: shouldn't include stdout / stderr
+        JoinHandle<Result<CompileResponse2>>, // TODO: shouldn't include stdout / stderr
         mpsc::Receiver<String>,
         mpsc::Receiver<String>,
     )> {
-        let Self {
-            tx: to_worker_tx,
-            command_tx,
-            id,
-            ..
-        } = self;
-        let id = id.fetch_add(1, Ordering::SeqCst);
+        let write_main = WriteFileRequest {
+            path: "src/main.rs".to_owned(),
+            content: request.code.into(),
+        };
 
-        let (from_worker_tx, mut from_worker_rx) = mpsc::channel(8);
+        use crate::message::{ExecuteCommandRequest, ReadFileRequest};
+        use crate::sandbox::{Channel, CompileTarget::*, Edition, Mode};
 
-        command_tx
-            .send(FanoutCommand::Listen(id, from_worker_tx))
-            .await
-            .unwrap();
-        to_worker_tx
-            .send(PlaygroundMessage::Request(
-                id,
-                HighLevelRequest::Compile(request),
-            ))
-            .await
-            .expect("handle this");
+        let edition = match request.edition {
+            Some(Edition::Rust2021) => "2021",
+            Some(Edition::Rust2018) => "2018",
+            Some(Edition::Rust2015) => "2015",
+            None => "2021",
+        };
+
+        let write_cargo_toml = WriteFileRequest {
+            path: "Cargo.toml".to_owned(),
+            content: format!(
+                r#"[package]
+                   name = "play"
+                   version = "0.1.0"
+                   edition = "{edition}"
+                   "#
+            )
+            .into(),
+        };
+
+        let mut args = if let Wasm = request.target {
+            vec!["wasm", "build"]
+        } else {
+            vec!["rustc"]
+        };
+        if let Mode::Release = request.mode {
+            args.push("--release");
+        }
+        let output_path: &str = "compilation";
+        match request.target {
+            Assembly(flavor, _, _) => {
+                use crate::sandbox::AssemblyFlavor::*;
+
+                // TODO: No compile-time string formatting.
+                args.extend(&["--", "--emit", "asm=compilation"]);
+
+                // Enable extra assembly comments for nightly builds
+                if let Channel::Nightly = request.channel {
+                    args.push("-Z");
+                    args.push("asm-comments");
+                }
+
+                args.push("-C");
+                match flavor {
+                    Att => args.push("llvm-args=-x86-asm-syntax=att"),
+                    Intel => args.push("llvm-args=-x86-asm-syntax=intel"),
+                }
+            }
+            LlvmIr => args.extend(&["--", "--emit", "llvm-ir=compilation"]),
+            Mir => args.extend(&["--", "--emit", "mir=compilation"]),
+            Hir => args.extend(&["--", "-Zunpretty=hir", "-o", output_path]),
+            Wasm => args.extend(&["-o", output_path]),
+        }
+        let mut envs = HashMap::new();
+        if request.backtrace {
+            envs.insert("RUST_BACKTRACE".to_owned(), "1".to_owned());
+        }
+
+        let execute_cargo = ExecuteCommandRequest {
+            cmd: "cargo".to_owned(),
+            args: args.into_iter().map(|s| s.to_owned()).collect(),
+            envs,
+            cwd: None,
+        };
+
+        let read_output = ReadFileRequest {
+            path: output_path.to_owned(),
+        };
+
+        let a = self.commander.one(write_main);
+        let b = self.commander.one(write_cargo_toml);
+
+        let (a, b) = join!(a, b);
+
+        // TODO: assert response success
 
         let (stdout_tx, stdout_rx) = mpsc::channel(8);
         let (stderr_tx, stderr_rx) = mpsc::channel(8);
 
-        let x = tokio::spawn(async move {
-            while let Some(container_msg) = from_worker_rx.recv().await {
-                match container_msg {
-                    ContainerMessage::Response(_, resp) => match resp {
-                        HighLevelResponse::Compile(resp) => return Ok(resp),
-                    },
-                    ContainerMessage::StdoutPacket(_, packet) => {
-                        stdout_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
-                    }
-                    ContainerMessage::StderrPacket(_, packet) => {
-                        stderr_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
+        let mut from_worker_rx = self.commander.many(execute_cargo).await;
+
+        let x = tokio::spawn({
+            let commander = self.commander.clone();
+            async move {
+                let mut success = false;
+
+                while let Some(container_msg) = from_worker_rx.recv().await {
+                    match container_msg {
+                        WorkerMessage::WriteFile(..) => todo!("nah"),
+                        WorkerMessage::ReadFile(..) => todo!("nah"),
+                        WorkerMessage::ExecuteCommand(..) => {
+                            success = true;
+                            break;
+                        }
+                        WorkerMessage::StdoutPacket(packet) => {
+                            stdout_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
+                        }
+                        WorkerMessage::StderrPacket(packet) => {
+                            stderr_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
+                        }
                     }
                 }
+
+                let f: ReadFileResponse = commander.one(read_output).await;
+                let code = f.0;
+                let code = String::from_utf8(code).unwrap();
+
+                // TODO: Stop listening
+
+                Ok(CompileResponse2 { success, code })
             }
-
-            // TODO: Stop listening
-
-            panic!("Shouldn't have ended yet");
         });
 
         Ok((x, stdout_rx, stderr_rx))
     }
 }
 
-pub type RequestId = u64;
 
-#[derive(Debug)]
-pub enum PlaygroundMessage {
-    Request(RequestId, HighLevelRequest),
-    StdinPacket(CommandId, String),
+#[derive(Debug, Clone)]
+struct Commander {
+    to_worker_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
+    command_tx: mpsc::Sender<DemultiplexCommand>,
+    id: Arc<AtomicU64>,
 }
 
-#[derive(Debug)]
-pub enum ContainerMessage {
-    Response(RequestId, HighLevelResponse),
-    StdoutPacket(CommandId, String),
-    StderrPacket(CommandId, String),
-}
+impl Commander {
+    async fn demultiplex(
+        mut command_rx: mpsc::Receiver<DemultiplexCommand>,
+        mut rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
+    ) {
+        let mut waiting = HashMap::new();
+        let mut waiting_once = HashMap::new();
 
-#[derive(Debug)]
-pub enum HighLevelRequest {
-    Compile(CompileRequest),
-}
+        loop {
+            select! {
+                command = command_rx.recv() => {
+                    let command = command.expect("Handle this");
+                    match command {
+                        DemultiplexCommand::Listen(id, waiter) => {
+                            waiting.insert(id, waiter);
+                            // TODO: ensure not replacing
+                        }
 
-#[derive(Debug)]
-pub enum HighLevelResponse {
-    Compile(CompileResponse),
+                        DemultiplexCommand::ListenOnce(id, waiter) => {
+                            waiting_once.insert(id, waiter);
+                            // TODO: ensure not replacing
+                        }
+                    }
+                },
+
+                msg = rx.recv() => {
+                    let msg = msg.expect("Handle this");
+
+                    let Multiplexed(id, data) = msg; // TODO: some uniform way of getting the ID for _any_ message
+
+                    if let Some(waiter) = waiting_once.remove(&id) {
+                        waiter.send(data).ok(/* Don't care about it */);
+                        continue;
+                    }
+
+                    if let Some(waiter) = waiting.get(&id) {
+                        waiter.send(data).await.ok(/* Don't care about it */);
+                        continue;
+                    }
+
+                    // TODO: log unattended messages?
+                }
+            }
+        }
+    }
+
+    fn next_id(&self) -> JobId {
+        self.id.fetch_add(1, Ordering::SeqCst)
+    }
+
+    async fn one<M>(&self, message: M) -> M::Response
+    where
+        M: Into<CoordinatorMessage>,
+        M: OneToOneResponse,
+        M::Response: TryFrom<WorkerMessage>,
+    {
+        let id = self.next_id();
+
+        let (from_worker_tx, from_worker_rx) = oneshot::channel();
+
+        self.command_tx
+            .send(DemultiplexCommand::ListenOnce(id, from_worker_tx))
+            .await
+            .unwrap();
+
+        self.to_worker_tx
+            .send(Multiplexed(id, message.into()))
+            .await
+            .unwrap();
+
+        let msg = from_worker_rx.await.unwrap();
+        msg.try_into().ok().unwrap()
+    }
+
+    async fn many<M>(&self, message: M) -> mpsc::Receiver<WorkerMessage>
+    where
+        M: Into<CoordinatorMessage>,
+    {
+        let id = self.next_id();
+
+        let (from_worker_tx, from_worker_rx) = mpsc::channel(8);
+
+        self.command_tx
+            .send(DemultiplexCommand::Listen(id, from_worker_tx))
+            .await
+            .unwrap();
+
+        self.to_worker_tx
+            .send(Multiplexed(id, message.into()))
+            .await
+            .unwrap();
+
+        from_worker_rx
+    }
 }
 
 #[derive(Debug)]
@@ -210,7 +339,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send worker message through channel"))]
     UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
     },
 
     #[snafu(display("Failed to receive worker message through channel"))]
@@ -227,11 +356,6 @@ pub enum Error {
     #[snafu(display("Failed to send worker response(job report) through channel"))]
     UnableToSendJobReport,
 
-    #[snafu(display("Failed to send request kind"))]
-    UnableToSendRequestKind {
-        source: mpsc::error::SendError<(RequestId, RequestKind)>,
-    },
-
     #[snafu(display("Failed to send job"))]
     UnableToSendJob {
         source: mpsc::error::SendError<CoordinatorMessage>,
@@ -242,161 +366,11 @@ pub enum Error {
         source: mpsc::error::SendError<CoordinatorMessage>,
     },
 
-    #[snafu(display("Failed to send container respones"))]
-    UnableToSendContainerResponse {
-        source: mpsc::error::SendError<ContainerMessage>,
-    },
-
-    #[snafu(display("Failed to send stdout packet"))]
-    UnableToSendStdoutPacket {
-        source: mpsc::error::SendError<ContainerMessage>,
-    },
-
-    #[snafu(display("Failed to send stderr packet"))]
-    UnableToSendStderrPacket {
-        source: mpsc::error::SendError<ContainerMessage>,
-    },
-
     #[snafu(display("PlaygroundMessage receiver ended unexpectedly"))]
     PlaygroundMessageReceiverEnded,
 
     #[snafu(display("WorkerMessage receiver ended unexpectedly"))]
     WorkerMessageReceiverEnded,
-
-    #[snafu(display("RequestKind receiver ended unexpectedly"))]
-    RequestKindReceiverEnded,
-}
-
-impl TryFrom<HighLevelRequest> for Job {
-    type Error = Error;
-
-    fn try_from(value: HighLevelRequest) -> Result<Self, Self::Error> {
-        match value {
-            HighLevelRequest::Compile(req) => {
-                use crate::message::*;
-                use crate::sandbox::CompileTarget::*;
-                use crate::sandbox::*;
-
-                let mut batch = Vec::new();
-                batch.push(Request::WriteFile(WriteFileRequest {
-                    path: "src/main.rs".to_owned(),
-                    content: req.code.into(),
-                }));
-                let edition = match req.edition {
-                    Some(Edition::Rust2021) => "2021",
-                    Some(Edition::Rust2018) => "2018",
-                    Some(Edition::Rust2015) => "2015",
-                    None => "2021",
-                };
-                batch.push(Request::WriteFile(WriteFileRequest {
-                    path: "Cargo.toml".to_owned(),
-                    content: format!(
-                        r#"[package]
-                                name = "play"
-                                version = "0.1.0"
-                                edition = "{edition}"
-                                "#
-                    )
-                    .into(),
-                }));
-                let mut args = if let Wasm = req.target {
-                    vec!["wasm", "build"]
-                } else {
-                    vec!["rustc"]
-                };
-                if let Mode::Release = req.mode {
-                    args.push("--release");
-                }
-                let output_path: &str = "compilation";
-                match req.target {
-                    Assembly(flavor, _, _) => {
-                        use crate::sandbox::AssemblyFlavor::*;
-
-                        // TODO: No compile-time string formatting.
-                        args.extend(&["--", "--emit", "asm=compilation"]);
-
-                        // Enable extra assembly comments for nightly builds
-                        if let Channel::Nightly = req.channel {
-                            args.push("-Z");
-                            args.push("asm-comments");
-                        }
-
-                        args.push("-C");
-                        match flavor {
-                            Att => args.push("llvm-args=-x86-asm-syntax=att"),
-                            Intel => args.push("llvm-args=-x86-asm-syntax=intel"),
-                        }
-                    }
-                    LlvmIr => args.extend(&["--", "--emit", "llvm-ir=compilation"]),
-                    Mir => args.extend(&["--", "--emit", "mir=compilation"]),
-                    Hir => args.extend(&["--", "-Zunpretty=hir", "-o", output_path]),
-                    Wasm => args.extend(&["-o", output_path]),
-                }
-                let mut envs = HashMap::new();
-                if req.backtrace {
-                    envs.insert("RUST_BACKTRACE".to_owned(), "1".to_owned());
-                }
-                batch.push(Request::ExecuteCommand(ExecuteCommandRequest {
-                    cmd: "cargo".to_owned(),
-                    args: args.into_iter().map(|s| s.to_owned()).collect(),
-                    envs,
-                    cwd: None,
-                }));
-                batch.push(Request::ReadFile(ReadFileRequest {
-                    path: output_path.to_owned(),
-                }));
-                Ok(Job { reqs: batch })
-            }
-        }
-    }
-}
-
-#[derive(Debug)]
-pub enum RequestKind {
-    Compile,
-}
-
-impl RequestKind {
-    fn kind(req: &HighLevelRequest) -> Self {
-        match req {
-            HighLevelRequest::Compile(_) => RequestKind::Compile,
-        }
-    }
-}
-
-impl From<(JobReport, RequestKind)> for HighLevelResponse {
-    fn from(value: (JobReport, RequestKind)) -> Self {
-        use crate::message::*;
-
-        let (JobReport { resps }, kind) = value;
-        let responses = resps;
-        match kind {
-            RequestKind::Compile => {
-                let mut success = false;
-                let mut code = String::new();
-                if let Some(ResponseResult(Ok(Response::ReadFile(ReadFileResponse(content))))) =
-                    responses.last()
-                {
-                    match from_utf8(content) {
-                        Ok(content) => {
-                            success = true;
-                            code = content.to_owned();
-                        }
-                        Err(_) => {
-                            success = false;
-                            code = "Error: Compilation output is not valid UTF-8 string".to_owned();
-                        }
-                    }
-                }
-                HighLevelResponse::Compile(CompileResponse {
-                    success,
-                    code,
-                    stdout: "".to_owned(),
-                    stderr: "".to_owned(),
-                })
-            }
-        }
-    }
 }
 
 macro_rules! docker_command {
@@ -436,6 +410,7 @@ fn run_worker_in_background(project_dir: &Path) -> Result<(Child, ChildStdin, Ch
         .arg(project_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
+        .stderr(Stdio::inherit())
         .spawn()
         .context(SpawnWorkerSnafu)?;
     let stdin = child.stdin.take().context(WorkerStdinCaptureSnafu)?;
@@ -449,8 +424,8 @@ fn spawn_io_queue(
     stdin: ChildStdin,
     stdout: ChildStdout,
 ) -> (
-    mpsc::Sender<CoordinatorMessage>,
-    mpsc::Receiver<WorkerMessage>,
+    mpsc::Sender<Multiplexed<CoordinatorMessage>>,
+    mpsc::Receiver<Multiplexed<WorkerMessage>>,
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
 
@@ -498,18 +473,7 @@ fn spawn_io_queue(
 pub fn spawn_container(project_dir: &Path) -> Result<Container> {
     let mut tasks = JoinSet::new();
     let (child, stdin, stdout) = run_worker_in_background(project_dir)?;
-    let (coordinator_msg_tx, worker_msg_rx) = spawn_io_queue(&mut tasks, stdin, stdout);
-    let (playground_msg_tx, playground_msg_rx) = mpsc::channel(8);
-    let (container_msg_tx, container_msg_rx) = mpsc::channel(8);
-    let (kind_tx, kind_rx) = mpsc::channel(8);
-    tasks.spawn(async move {
-        lower_operations(playground_msg_rx, coordinator_msg_tx, kind_tx).await?;
-        Ok(())
-    });
-    tasks.spawn(async move {
-        lift_operation_results(worker_msg_rx, container_msg_tx, kind_rx).await?;
-        Ok(())
-    });
+    let (to_worker_tx, from_worker_rx) = spawn_io_queue(&mut tasks, stdin, stdout);
     tokio::spawn(async move {
         if let Some(task) = tasks.join_next().await {
             eprintln!("{task:?}");
@@ -522,82 +486,15 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
     });
 
     let (command_tx, command_rx) = mpsc::channel(8);
-    tokio::spawn(Container::fanout(command_rx, container_msg_rx));
+    tokio::spawn(Commander::demultiplex(command_rx, from_worker_rx));
 
-    Ok(Container {
-        child,
-        tx: playground_msg_tx,
+    let commander = Commander {
+        to_worker_tx,
         command_tx,
-        id: AtomicU64::new(0),
-    })
-}
+        id: Default::default(),
+    };
 
-async fn lower_operations(
-    mut playground_msg_rx: mpsc::Receiver<PlaygroundMessage>,
-    coordinator_msg_tx: mpsc::Sender<CoordinatorMessage>,
-    kind_tx: mpsc::Sender<(RequestId, RequestKind)>,
-) -> Result<()> {
-    loop {
-        let playground_msg = playground_msg_rx
-            .recv()
-            .await
-            .context(PlaygroundMessageReceiverEndedSnafu)?;
-        match playground_msg {
-            PlaygroundMessage::Request(id, req) => {
-                let kind = RequestKind::kind(&req);
-                kind_tx
-                    .send((id, kind))
-                    .await
-                    .context(UnableToSendRequestKindSnafu)?;
-                let job = req.try_into()?;
-                let coordinator_msg = CoordinatorMessage::Request(id, job);
-                coordinator_msg_tx
-                    .send(coordinator_msg)
-                    .await
-                    .context(UnableToSendJobSnafu)?;
-            }
-            PlaygroundMessage::StdinPacket(cmd_id, data) => {
-                coordinator_msg_tx
-                    .send(CoordinatorMessage::StdinPacket(cmd_id, data))
-                    .await
-                    .context(UnableToSendStdinPacketSnafu)?;
-            }
-        }
-    }
-}
-
-async fn lift_operation_results(
-    mut worker_msg_rx: mpsc::Receiver<WorkerMessage>,
-    container_msg_tx: mpsc::Sender<ContainerMessage>,
-    mut kind_rx: mpsc::Receiver<(RequestId, RequestKind)>,
-) -> Result<()> {
-    let mut request_kinds = HashMap::new();
-    loop {
-        select! {
-            worker_msg = worker_msg_rx.recv() => {
-                let worker_msg = worker_msg.context(WorkerMessageReceiverEndedSnafu)?;
-                match worker_msg {
-                    WorkerMessage::Response(id, job_report) => {
-                        if let Some(kind) = request_kinds.remove(&id) {
-                            let response = (job_report, kind).into();
-                            let container_msg = ContainerMessage::Response(id, response);
-                            container_msg_tx.send(container_msg).await.context(UnableToSendContainerResponseSnafu)?;
-                        }
-                    }
-                    WorkerMessage::StdoutPacket(cmd_id, data) => {
-                        container_msg_tx.send(ContainerMessage::StdoutPacket(cmd_id, data)).await.context(UnableToSendStdoutPacketSnafu)?;
-                    }
-                    WorkerMessage::StderrPacket(cmd_id, data) => {
-                        container_msg_tx.send(ContainerMessage::StderrPacket(cmd_id, data)).await.context(UnableToSendStderrPacketSnafu)?;
-                    }
-                }
-            }
-            kind_msg = kind_rx.recv() => {
-                let (id, kind) = kind_msg.context(RequestKindReceiverEndedSnafu)?;
-                request_kinds.insert(id, kind);
-            }
-        }
-    }
+    Ok(Container { child, commander })
 }
 
 #[cfg(test)]

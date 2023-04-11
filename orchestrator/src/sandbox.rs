@@ -81,3 +81,8 @@ pub struct CompileResponse {
     pub stderr: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct CompileResponse2 {
+    pub success: bool,
+    pub code: String,
+}

@@ -1,59 +1,65 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::worker;
-
 pub type JobId = u64;
 pub type Path = String;
-pub type ResponseError = String;
-pub type CommandId = (JobId, u64);
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct Job {
-    pub reqs: Vec<Request>,
+macro_rules! impl_conversions {
+    ($enum_type:ident, $($variant_name:ident => $variant_type:ident),* $(,)?) => {
+        $(
+            impl From<$variant_type> for $enum_type {
+                fn from(other: $variant_type) -> Self {
+                    $enum_type::$variant_name(other)
+                }
+            }
+
+            impl TryFrom<$enum_type> for $variant_type {
+                type Error = $enum_type;
+
+                fn try_from(other: $enum_type) -> Result<Self, Self::Error> {
+                    match other {
+                        $enum_type::$variant_name(v) => Ok(v),
+                        other => Err(other),
+                    }
+                }
+            }
+        )*
+    };
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct JobReport {
-    pub resps: Vec<ResponseResult>,
-}
-
-impl JobReport {
-    pub fn is_ok(&self) -> bool {
-        if let Some(resp) = self.resps.last() {
-            resp.0.is_ok()
-        } else {
-            false
-        }
-    }
-}
+pub struct Multiplexed<T>(pub JobId, pub T);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum CoordinatorMessage {
-    Request(JobId, Job),
-    StdinPacket(CommandId, String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum WorkerMessage {
-    Response(JobId, JobReport),
-    StdoutPacket(CommandId, String),
-    StderrPacket(CommandId, String),
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub enum Request {
     WriteFile(WriteFileRequest),
     ReadFile(ReadFileRequest),
     ExecuteCommand(ExecuteCommandRequest),
+    StdinPacket(String),
 }
 
+impl_conversions!(
+    CoordinatorMessage,
+    WriteFile => WriteFileRequest,
+    ReadFile => ReadFileRequest,
+    ExecuteCommand => ExecuteCommandRequest,
+);
+
 #[derive(Debug, Serialize, Deserialize)]
-pub enum Response {
+pub enum WorkerMessage {
     WriteFile(WriteFileResponse),
     ReadFile(ReadFileResponse),
     ExecuteCommand(ExecuteCommandResponse),
+    StdoutPacket(String),
+    StderrPacket(String),
 }
+
+impl_conversions!(
+    WorkerMessage,
+    WriteFile => WriteFileResponse,
+    ReadFile => ReadFileResponse,
+    ExecuteCommand => ExecuteCommandResponse,
+);
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WriteFileRequest {
@@ -86,11 +92,18 @@ pub struct ExecuteCommandResponse(pub ());
 #[derive(Debug, Serialize, Deserialize)]
 pub struct StreamCommandResponse(pub ());
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ResponseResult(pub Result<Response, ResponseError>);
+pub trait OneToOneResponse {
+    type Response;
+}
 
-impl From<Result<Response, worker::Error>> for ResponseResult {
-    fn from(value: Result<Response, worker::Error>) -> Self {
-        ResponseResult(value.map_err(|e| format!("{e:#}")))
-    }
+impl OneToOneResponse for WriteFileRequest {
+    type Response = WriteFileResponse;
+}
+
+impl OneToOneResponse for ReadFileRequest {
+    type Response = ReadFileResponse;
+}
+
+impl OneToOneResponse for ExecuteCommandRequest {
+    type Response = ExecuteCommandResponse;
 }
