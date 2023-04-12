@@ -4,23 +4,12 @@ use std::collections::HashMap;
 pub type JobId = u64;
 pub type Path = String;
 
-macro_rules! impl_conversions {
+macro_rules! impl_narrow_to_broad {
     ($enum_type:ident, $($variant_name:ident => $variant_type:ident),* $(,)?) => {
         $(
             impl From<$variant_type> for $enum_type {
                 fn from(other: $variant_type) -> Self {
                     $enum_type::$variant_name(other)
-                }
-            }
-
-            impl TryFrom<$enum_type> for $variant_type {
-                type Error = $enum_type;
-
-                fn try_from(other: $enum_type) -> Result<Self, Self::Error> {
-                    match other {
-                        $enum_type::$variant_name(v) => Ok(v),
-                        other => Err(other),
-                    }
                 }
             }
         )*
@@ -38,7 +27,7 @@ pub enum CoordinatorMessage {
     StdinPacket(String),
 }
 
-impl_conversions!(
+impl_narrow_to_broad!(
     CoordinatorMessage,
     WriteFile => WriteFileRequest,
     ReadFile => ReadFileRequest,
@@ -52,9 +41,35 @@ pub enum WorkerMessage {
     ExecuteCommand(ExecuteCommandResponse),
     StdoutPacket(String),
     StderrPacket(String),
+    Error(SerializedError),
 }
 
-impl_conversions!(
+macro_rules! impl_broad_to_narrow_with_error {
+    ($enum_type:ident, $($variant_name:ident => $variant_type:ty),* $(,)?) => {
+        $(
+            impl TryFrom<$enum_type> for Result<$variant_type, SerializedError> {
+                type Error = $enum_type;
+
+                fn try_from(other: $enum_type) -> Result<Self, Self::Error> {
+                    match other {
+                        $enum_type::$variant_name(x) => Ok(Ok(x)),
+                        $enum_type::Error(e) => Ok(Err(e)),
+                        o => Err(o)
+                    }
+                }
+            }
+        )*
+    };
+}
+
+impl_narrow_to_broad!(
+    WorkerMessage,
+    WriteFile => WriteFileResponse,
+    ReadFile => ReadFileResponse,
+    ExecuteCommand => ExecuteCommandResponse,
+);
+
+impl_broad_to_narrow_with_error!(
     WorkerMessage,
     WriteFile => WriteFileResponse,
     ReadFile => ReadFileResponse,
@@ -87,7 +102,18 @@ pub struct ExecuteCommandRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct ExecuteCommandResponse(pub ());
+pub struct ExecuteCommandResponse {
+    pub success: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct SerializedError(pub String);
+
+impl SerializedError {
+    pub fn new(e: impl snafu::Error) -> Self {
+        Self(snafu::Report::from_error(e).to_string())
+    }
+}
 
 pub trait OneToOneResponse {
     type Response;

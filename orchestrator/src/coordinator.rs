@@ -21,7 +21,7 @@ use tokio_util::io::SyncIoBridge;
 use crate::{
     message::{
         CoordinatorMessage, JobId, Multiplexed, OneToOneResponse, ReadFileRequest,
-        ReadFileResponse, WorkerMessage,
+        ReadFileResponse, SerializedError, WorkerMessage,
     },
     sandbox::{CompileRequest, CompileResponse, CompileResponse2},
     DropErrorDetailsExt, JoinSetExt,
@@ -86,8 +86,6 @@ impl Container {
         write_main.context(CouldNotWriteCodeSnafu)?;
         write_cargo_toml.context(CouldNotWriteCargoTomlSnafu)?;
 
-        // TODO: assert response success
-
         let (stdout_tx, stdout_rx) = mpsc::channel(8);
         let (stderr_tx, stderr_rx) = mpsc::channel(8);
 
@@ -104,9 +102,8 @@ impl Container {
 
                 while let Some(container_msg) = from_worker_rx.recv().await {
                     match container_msg {
-                        WorkerMessage::ExecuteCommand(..) => {
-                            // TODO: success should from the command response.
-                            success = true;
+                        WorkerMessage::ExecuteCommand(resp) => {
+                            success = resp.success;
                             break;
                         }
                         WorkerMessage::StdoutPacket(packet) => {
@@ -259,7 +256,7 @@ impl Commander {
     where
         M: Into<CoordinatorMessage>,
         M: OneToOneResponse,
-        M::Response: TryFrom<WorkerMessage>,
+        Result<M::Response, SerializedError>: TryFrom<WorkerMessage>,
     {
         use commander_error::*;
 
@@ -273,7 +270,11 @@ impl Commander {
             .await
             .context(UnableToReceiveFromDemultiplexerSnafu)?;
 
-        msg.try_into().ok().context(UnexpectedResponseTypeSnafu)
+        match msg.try_into() {
+            Ok(Ok(v)) => Ok(v),
+            Ok(Err(e)) => WorkerOperationFailedSnafu { text: e.0 }.fail(),
+            Err(_) => UnexpectedResponseTypeSnafu.fail(),
+        }
     }
 
     async fn many<M>(&self, message: M) -> Result<mpsc::Receiver<WorkerMessage>, CommanderError>
@@ -311,6 +312,9 @@ pub enum CommanderError {
 
     #[snafu(display("Did not receive the expected response type from the worker"))]
     UnexpectedResponseType,
+
+    #[snafu(display("The worker operation failed"))]
+    WorkerOperationFailed { text: String },
 }
 
 #[derive(Debug)]

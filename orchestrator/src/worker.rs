@@ -16,7 +16,8 @@ use tokio::{
 use crate::{
     message::{
         CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
-        ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
+        ReadFileRequest, ReadFileResponse, SerializedError, WorkerMessage, WriteFileRequest,
+        WriteFileResponse,
     },
     DropErrorDetailsExt, JoinSetExt,
 };
@@ -27,12 +28,12 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    UnableToWriteFile {
-        source: WriteFileError,
+    UnableToSendWriteFileResponse {
+        source: MultiplexingSenderError,
     },
 
-    UnableToReadFile {
-        source: ReadFileError,
+    UnableToSendReadFileResponse {
+        source: MultiplexingSenderError,
     },
 
     #[snafu(display("Failed to send command execution request"))]
@@ -82,16 +83,26 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
 
             match coordinator_msg {
                 CoordinatorMessage::WriteFile(req) => {
-                    msg_tasks.spawn({
-                        handle_write_file(req, project_dir.clone(), worker_msg_tx())
-                            .context(UnableToWriteFileSnafu)
+                    let project_dir = project_dir.clone();
+                    let worker_msg_tx = worker_msg_tx();
+
+                    msg_tasks.spawn(async move {
+                        worker_msg_tx
+                            .send(handle_write_file(req, project_dir).await)
+                            .await
+                            .context(UnableToSendWriteFileResponseSnafu)
                     });
                 }
 
                 CoordinatorMessage::ReadFile(req) => {
-                    msg_tasks.spawn({
-                        handle_read_file(req, project_dir.clone(), worker_msg_tx())
-                            .context(UnableToReadFileSnafu)
+                    let project_dir = project_dir.clone();
+                    let worker_msg_tx = worker_msg_tx();
+
+                    msg_tasks.spawn(async move {
+                        worker_msg_tx
+                            .send(handle_read_file(req, project_dir).await)
+                            .await
+                            .context(UnableToSendReadFileResponseSnafu)
                     });
                 }
 
@@ -113,7 +124,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
             }
         }
 
-        <Result<_>>::Ok(())
+        <Result<(), Error>>::Ok(())
     });
 
     // Shutdown when any of these critical tasks goes wrong.
@@ -132,17 +143,36 @@ struct MultiplexingSender {
 impl MultiplexingSender {
     async fn send(
         &self,
-        message: WorkerMessage,
-    ) -> Result<(), mpsc::error::SendError<Multiplexed<WorkerMessage>>> {
-        self.tx.send(Multiplexed(self.job_id, message)).await
+        message: Result<impl Into<WorkerMessage>, impl std::error::Error>,
+    ) -> Result<(), MultiplexingSenderError> {
+        use multiplexing_sender_error::*;
+
+        let message = match message {
+            Ok(v) => v.into(),
+            Err(e) => WorkerMessage::Error(SerializedError::new(e)),
+        };
+
+        let message = Multiplexed(self.job_id, message);
+
+        self.tx
+            .send(message)
+            .await
+            .drop_error_details()
+            .context(UnableToSendWorkerMessageSnafu)
     }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum MultiplexingSenderError {
+    #[snafu(display("Failed to send worker message to serialization task"))]
+    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
 }
 
 async fn handle_write_file(
     req: WriteFileRequest,
     project_dir: PathBuf,
-    worker_msg_tx: MultiplexingSender,
-) -> Result<(), WriteFileError> {
+) -> Result<WriteFileResponse, WriteFileError> {
     use write_file_error::*;
 
     let path = parse_working_dir(Some(req.path), &project_dir);
@@ -158,11 +188,7 @@ async fn handle_write_file(
         .await
         .context(UnableToWriteFileSnafu { path })?;
 
-    worker_msg_tx
-        .send(WriteFileResponse(()).into())
-        .await
-        .drop_error_details()
-        .context(UnableToSendWorkerMessageSnafu)
+    Ok(WriteFileResponse(()))
 }
 
 #[derive(Debug, Snafu)]
@@ -187,8 +213,7 @@ pub enum WriteFileError {
 async fn handle_read_file(
     req: ReadFileRequest,
     project_dir: PathBuf,
-    worker_msg_tx: MultiplexingSender,
-) -> Result<(), ReadFileError> {
+) -> Result<ReadFileResponse, ReadFileError> {
     use read_file_error::*;
 
     let path = parse_working_dir(Some(req.path), &project_dir);
@@ -197,11 +222,7 @@ async fn handle_read_file(
         .await
         .context(UnableToReadFileSnafu { path })?;
 
-    worker_msg_tx
-        .send(ReadFileResponse(content).into())
-        .await
-        .drop_error_details()
-        .context(UnableToSendWorkerMessageSnafu)
+    Ok(ReadFileResponse(content))
 }
 
 #[derive(Debug, Snafu)]
@@ -265,12 +286,14 @@ async fn manage_processes(
                 let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, job_id).context(StdioSnafu)?;
                 // TODO: watch this spawn
                 tokio::spawn(async move {
-                    child.wait().await.context(WaitChildSnafu)?;
+                    let r = child.wait().await.context(WaitChildSnafu).map(|status| {
+                        let success = status.success();
+                        ExecuteCommandResponse { success }
+                    });
 
                     response_tx
-                        .send(ExecuteCommandResponse(()).into())
+                        .send(r)
                         .await
-                        .drop_error_details()
                         .context(UnableToSendWorkerMessageSnafu)
                 });
                 processes.insert(job_id, task_set);
@@ -316,7 +339,7 @@ pub enum ProcessError {
 
     #[snafu(display("Failed to send worker message to serialization task"))]
     UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<()>,
+        source: MultiplexingSenderError,
     },
 }
 
