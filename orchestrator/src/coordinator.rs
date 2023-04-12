@@ -24,6 +24,7 @@ use crate::{
         WriteFileRequest,
     },
     sandbox::{CompileRequest, CompileResponse, CompileResponse2},
+    DropErrorDetailsExt,
 };
 
 #[derive(Debug)]
@@ -188,7 +189,6 @@ impl Container {
     }
 }
 
-
 #[derive(Debug, Clone)]
 struct Commander {
     to_worker_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
@@ -338,33 +338,16 @@ pub enum Error {
     CoordinatorMessageSerialization { source: bincode::Error },
 
     #[snafu(display("Failed to send worker message through channel"))]
-    UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
-    },
+    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to receive worker message through channel"))]
     UnableToReceiveWorkerMessage,
-
-    #[snafu(display("Failed to send coordinator message through channel"))]
-    UnableToSendCoordinatorMessage {
-        source: mpsc::error::SendError<CoordinatorMessage>,
-    },
 
     #[snafu(display("Failed to receive coordinator message through channel"))]
     UnableToReceiveCoordinatorMessage,
 
     #[snafu(display("Failed to send worker response(job report) through channel"))]
     UnableToSendJobReport,
-
-    #[snafu(display("Failed to send job"))]
-    UnableToSendJob {
-        source: mpsc::error::SendError<CoordinatorMessage>,
-    },
-
-    #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket {
-        source: mpsc::error::SendError<CoordinatorMessage>,
-    },
 
     #[snafu(display("PlaygroundMessage receiver ended unexpectedly"))]
     PlaygroundMessageReceiverEnded,
@@ -440,6 +423,7 @@ fn spawn_io_queue(
                     .context(WorkerMessageDeserializationSnafu)?;
 
                 tx.blocking_send(worker_msg)
+                    .drop_error_details()
                     .context(UnableToSendWorkerMessageSnafu)?;
             }
         })

@@ -18,6 +18,7 @@ use crate::message::{
     CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
     ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
 };
+use crate::DropErrorDetailsExt;
 
 type CommandRequest = (JobId, ExecuteCommandRequest, Arc<Notify>);
 
@@ -38,9 +39,7 @@ pub enum Error {
     },
 
     #[snafu(display("Failed to send command execution request"))]
-    UnableToSendCommandExecutionRequest {
-        source: mpsc::error::SendError<CommandRequest>,
-    },
+    UnableToSendCommandExecutionRequest { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to spawn child process"))]
     UnableToSpawnProcess { source: std::io::Error },
@@ -55,9 +54,7 @@ pub enum Error {
     UnableToCaptureStderr,
 
     #[snafu(display("Failed to send stdin data"))]
-    UnableToSendStdinData {
-        source: mpsc::error::SendError<String>,
-    },
+    UnableToSendStdinData { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to receive stdin data"))]
     UnableToReceiveStdinData,
@@ -78,35 +75,25 @@ pub enum Error {
     UnableToFlushStdout { source: std::io::Error },
 
     #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket {
-        source: mpsc::error::SendError<Multiplexed<String>>,
-    },
+    UnableToSendStdinPacket { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to send stdout packet"))]
-    UnableToSendStdoutPacket {
-        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
-    },
+    UnableToSendStdoutPacket { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to send stderr packet"))]
-    UnableToSendStderrPacket {
-        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
-    },
+    UnableToSendStderrPacket { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to wait for child process exiting"))]
     WaitChild { source: std::io::Error },
 
     #[snafu(display("Failed to send coordinator message from deserialization task"))]
-    UnableToSendCoordinatorMessage {
-        source: mpsc::error::SendError<Multiplexed<CoordinatorMessage>>,
-    },
+    UnableToSendCoordinatorMessage { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to receive coordinator message from deserialization task"))]
     UnableToReceiveCoordinatorMessage,
 
     #[snafu(display("Failed to send worker message to serialization task"))]
-    UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
-    },
+    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
 
     #[snafu(display("Failed to receive worker message"))]
     UnableToReceiveWorkerMessage,
@@ -165,6 +152,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                     worker_msg_tx
                         .send(Multiplexed(job_id, WriteFileResponse(()).into()))
                         .await
+                        .drop_error_details()
                         .context(UnableToSendWorkerMessageSnafu)?;
                 }
 
@@ -179,6 +167,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                     worker_msg_tx
                         .send(Multiplexed(job_id, ReadFileResponse(content).into()))
                         .await
+                        .drop_error_details()
                         .context(UnableToSendWorkerMessageSnafu)?;
                 }
 
@@ -188,12 +177,14 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                     cmd_tx
                         .send((job_id, cmd, notify.clone()))
                         .await
+                        .drop_error_details()
                         .context(UnableToSendCommandExecutionRequestSnafu)?;
                     notify.notified().await;
 
                     worker_msg_tx
                         .send(Multiplexed(job_id, ExecuteCommandResponse(()).into()))
                         .await
+                        .drop_error_details()
                         .context(UnableToSendWorkerMessageSnafu)?;
                 }
 
@@ -201,6 +192,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                     stdin_tx
                         .send(Multiplexed(job_id, data))
                         .await
+                        .drop_error_details()
                         .context(UnableToSendStdinPacketSnafu)?;
                 }
             }
@@ -267,7 +259,7 @@ async fn manage_processes(
                 // Dispatch stdin packet to different child by attached command id.
                 let Multiplexed(job_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
                 if let Some(stdin_tx) = stdin_senders.get(&job_id) {
-                    stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
+                    stdin_tx.send(packet).await.drop_error_details().context(UnableToSendStdinDataSnafu)?;
                 }
             }
         }
@@ -313,6 +305,7 @@ fn stream_stdio(
                 coordinator_tx_out
                     .send(Multiplexed(job_id, WorkerMessage::StdoutPacket(buffer)))
                     .await
+                    .drop_error_details()
                     .context(UnableToSendStdoutPacketSnafu)?;
             } else {
                 break;
@@ -334,6 +327,7 @@ fn stream_stdio(
                 coordinator_tx_err
                     .send(Multiplexed(job_id, WorkerMessage::StderrPacket(buffer)))
                     .await
+                    .drop_error_details()
                     .context(UnableToSendStderrPacketSnafu)?;
             } else {
                 break;
@@ -363,6 +357,7 @@ fn spawn_io_queue(
 
                 coordinator_msg_tx
                     .blocking_send(coordinator_msg)
+                    .drop_error_details()
                     .context(UnableToSendCoordinatorMessageSnafu)?;
             }
         }).await.unwrap(/* Panic occurred; re-raising */)
