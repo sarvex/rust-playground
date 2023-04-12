@@ -14,11 +14,14 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::message::{
-    CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
-    ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
-};
 use crate::DropErrorDetailsExt;
+use crate::{
+    message::{
+        CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
+        ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
+    },
+    JoinSetExt,
+};
 
 type CommandRequest = (JobId, ExecuteCommandRequest, Arc<Notify>);
 
@@ -346,37 +349,34 @@ fn spawn_io_queue(
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
 
-    tasks.spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let stdin = std::io::stdin();
-            let mut stdin = BufReader::new(stdin);
+    tasks.spawn_blocking(move || {
+        let stdin = std::io::stdin();
+        let mut stdin = BufReader::new(stdin);
 
-            loop {
-                let coordinator_msg = bincode::deserialize_from(&mut stdin)
-                    .context(UnableToDeserializeCoordinatorMessageSnafu)?;
+        loop {
+            let coordinator_msg = bincode::deserialize_from(&mut stdin)
+                .context(UnableToDeserializeCoordinatorMessageSnafu)?;
 
-                coordinator_msg_tx
-                    .blocking_send(coordinator_msg)
-                    .drop_error_details()
-                    .context(UnableToSendCoordinatorMessageSnafu)?;
-            }
-        }).await.unwrap(/* Panic occurred; re-raising */)
+            coordinator_msg_tx
+                .blocking_send(coordinator_msg)
+                .drop_error_details()
+                .context(UnableToSendCoordinatorMessageSnafu)?;
+        }
     });
 
-    tasks.spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let stdout = std::io::stdout();
-            let mut stdout = BufWriter::new(stdout);
+    tasks.spawn_blocking(move || {
+        let stdout = std::io::stdout();
+        let mut stdout = BufWriter::new(stdout);
 
-            loop {
-                let worker_msg = worker_msg_rx
-                    .blocking_recv()
-                    .context(UnableToReceiveWorkerMessageSnafu)?;
+        loop {
+            let worker_msg = worker_msg_rx
+                .blocking_recv()
+                .context(UnableToReceiveWorkerMessageSnafu)?;
 
-                bincode::serialize_into(&mut stdout, &worker_msg).context(UnableToSerializeWorkerMessageSnafu)?;
+            bincode::serialize_into(&mut stdout, &worker_msg)
+                .context(UnableToSerializeWorkerMessageSnafu)?;
 
-                stdout.flush().context(UnableToFlushStdoutSnafu)?;
-            }
-        }).await.unwrap(/* Panic occurred; re-raising */)
+            stdout.flush().context(UnableToFlushStdoutSnafu)?;
+        }
     });
 }

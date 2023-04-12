@@ -24,7 +24,7 @@ use crate::{
         WriteFileRequest,
     },
     sandbox::{CompileRequest, CompileResponse, CompileResponse2},
-    DropErrorDetailsExt,
+    DropErrorDetailsExt, JoinSetExt,
 };
 
 #[derive(Debug)]
@@ -453,43 +453,35 @@ fn spawn_io_queue(
     use std::io::{prelude::*, BufReader, BufWriter};
 
     let (tx, worker_msg_rx) = mpsc::channel(8);
-    tasks.spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let stdout = SyncIoBridge::new(stdout);
-            let mut stdout = BufReader::new(stdout);
+    tasks.spawn_blocking(move || {
+        let stdout = SyncIoBridge::new(stdout);
+        let mut stdout = BufReader::new(stdout);
 
-            loop {
-                let worker_msg = bincode::deserialize_from(&mut stdout)
-                    .context(WorkerMessageDeserializationSnafu)?;
+        loop {
+            let worker_msg = bincode::deserialize_from(&mut stdout)
+                .context(WorkerMessageDeserializationSnafu)?;
 
-                tx.blocking_send(worker_msg)
-                    .drop_error_details()
-                    .context(UnableToSendWorkerMessageSnafu)?;
-            }
-        })
-        .await
-        .unwrap(/* Panic occurred; re-raising */)
+            tx.blocking_send(worker_msg)
+                .drop_error_details()
+                .context(UnableToSendWorkerMessageSnafu)?;
+        }
     });
 
     let (coordinator_msg_tx, mut rx) = mpsc::channel(8);
-    tasks.spawn(async move {
-        tokio::task::spawn_blocking(move || {
-            let stdin = SyncIoBridge::new(stdin);
-            let mut stdin = BufWriter::new(stdin);
+    tasks.spawn_blocking(move || {
+        let stdin = SyncIoBridge::new(stdin);
+        let mut stdin = BufWriter::new(stdin);
 
-            loop {
-                let coordinator_msg = rx
-                    .blocking_recv()
-                    .context(UnableToReceiveCoordinatorMessageSnafu)?;
+        loop {
+            let coordinator_msg = rx
+                .blocking_recv()
+                .context(UnableToReceiveCoordinatorMessageSnafu)?;
 
-                bincode::serialize_into(&mut stdin, &coordinator_msg)
-                    .context(CoordinatorMessageSerializationSnafu)?;
+            bincode::serialize_into(&mut stdin, &coordinator_msg)
+                .context(CoordinatorMessageSerializationSnafu)?;
 
-                stdin.flush().context(WorkerStdinFlushSnafu)?;
-            }
-        })
-        .await
-        .unwrap(/* Panic occurred; re-raising */)
+            stdin.flush().context(WorkerStdinFlushSnafu)?;
+        }
     });
     (coordinator_msg_tx, worker_msg_rx)
 }
