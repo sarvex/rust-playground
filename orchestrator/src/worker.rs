@@ -3,14 +3,13 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
-    sync::Arc,
 };
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
     process::{Child, Command},
     select,
-    sync::{mpsc, Notify},
+    sync::mpsc,
     task::JoinSet,
 };
 
@@ -22,9 +21,9 @@ use crate::{
     DropErrorDetailsExt, JoinSetExt,
 };
 
-type CommandRequest = (JobId, ExecuteCommandRequest, Arc<Notify>);
+type CommandRequest = (Multiplexed<ExecuteCommandRequest>, MultiplexingSender);
 
-type Result<T> = std::result::Result<T, Error>;
+type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -115,6 +114,7 @@ pub enum Error {
 
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
     let mut tasks = JoinSet::new();
+
     let (coordinator_msg_tx, mut coordinator_msg_rx) = mpsc::channel(8);
     let (worker_msg_tx, worker_msg_rx) = mpsc::channel(8);
     spawn_io_queue(&mut tasks, coordinator_msg_tx, worker_msg_rx);
@@ -127,67 +127,36 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
         cmd_rx,
         project_dir.clone(),
     ));
+
     tasks.spawn(async move {
-        let project_path = project_dir.as_path();
+        let mut msg_tasks = JoinSet::new(); // TODO check this
+
         loop {
-            let coordinator_msg = coordinator_msg_rx
+            let Multiplexed(job_id, coordinator_msg) = coordinator_msg_rx
                 .recv()
                 .await
                 .context(UnableToReceiveCoordinatorMessageSnafu)?;
 
-            let Multiplexed(job_id, coordinator_msg) = coordinator_msg;
+            let worker_msg_tx = || MultiplexingSender {
+                job_id,
+                tx: worker_msg_tx.clone(),
+            };
 
             match coordinator_msg {
-                CoordinatorMessage::WriteFile(WriteFileRequest { path, content }) => {
-                    let path = parse_working_dir(Some(path), project_path);
-
-                    // Create intermediate directories.
-                    if let Some(parent_dir) = path.parent() {
-                        fs::create_dir_all(parent_dir)
-                            .await
-                            .context(UnableToCreateDirSnafu)?;
-                    }
-                    fs::write(path, content)
-                        .await
-                        .context(UnableToWriteFileSnafu)?;
-
-                    worker_msg_tx
-                        .send(Multiplexed(job_id, WriteFileResponse(()).into()))
-                        .await
-                        .drop_error_details()
-                        .context(UnableToSendWorkerMessageSnafu)?;
+                CoordinatorMessage::WriteFile(req) => {
+                    msg_tasks.spawn(handle_write_file(req, project_dir.clone(), worker_msg_tx()));
                 }
 
-                CoordinatorMessage::ReadFile(ReadFileRequest { path }) => {
-                    // TODO: spawn
-
-                    let path = parse_working_dir(Some(path), project_path);
-                    let content = fs::read(&path)
-                        .await
-                        .context(UnableToReadFileSnafu { path })?;
-
-                    worker_msg_tx
-                        .send(Multiplexed(job_id, ReadFileResponse(content).into()))
-                        .await
-                        .drop_error_details()
-                        .context(UnableToSendWorkerMessageSnafu)?;
+                CoordinatorMessage::ReadFile(req) => {
+                    msg_tasks.spawn(handle_read_file(req, project_dir.clone(), worker_msg_tx()));
                 }
 
                 CoordinatorMessage::ExecuteCommand(cmd) => {
-                    // TODO: spawn
-                    let notify = Arc::new(Notify::new());
                     cmd_tx
-                        .send((job_id, cmd, notify.clone()))
+                        .send((Multiplexed(job_id, cmd), worker_msg_tx()))
                         .await
                         .drop_error_details()
                         .context(UnableToSendCommandExecutionRequestSnafu)?;
-                    notify.notified().await;
-
-                    worker_msg_tx
-                        .send(Multiplexed(job_id, ExecuteCommandResponse(()).into()))
-                        .await
-                        .drop_error_details()
-                        .context(UnableToSendWorkerMessageSnafu)?;
                 }
 
                 CoordinatorMessage::StdinPacket(data) => {
@@ -200,11 +169,71 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
             }
         }
     });
+
     // Shutdown when any of these critical tasks goes wrong.
     if tasks.join_next().await.is_some() {
         tasks.shutdown().await;
     }
+
     Ok(())
+}
+
+struct MultiplexingSender {
+    job_id: JobId,
+    tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
+}
+
+impl MultiplexingSender {
+    async fn send(
+        &self,
+        message: WorkerMessage,
+    ) -> Result<(), mpsc::error::SendError<Multiplexed<WorkerMessage>>> {
+        self.tx.send(Multiplexed(self.job_id, message)).await
+    }
+}
+
+// TODO: smaller errors?
+async fn handle_write_file(
+    req: WriteFileRequest,
+    project_dir: PathBuf,
+    worker_msg_tx: MultiplexingSender,
+) -> Result<()> {
+    let path = parse_working_dir(Some(req.path), &project_dir);
+
+    // Create intermediate directories.
+    if let Some(parent_dir) = path.parent() {
+        fs::create_dir_all(parent_dir)
+            .await
+            .context(UnableToCreateDirSnafu)?;
+    }
+
+    fs::write(path, req.content)
+        .await
+        .context(UnableToWriteFileSnafu)?;
+
+    worker_msg_tx
+        .send(WriteFileResponse(()).into())
+        .await
+        .drop_error_details()
+        .context(UnableToSendWorkerMessageSnafu)
+}
+
+async fn handle_read_file(
+    req: ReadFileRequest,
+    project_dir: PathBuf,
+    worker_msg_tx: MultiplexingSender,
+) -> Result<()> {
+    let path = parse_working_dir(Some(req.path), &project_dir);
+
+    let content = fs::read(&path)
+        .await
+        .context(UnableToReadFileSnafu { path })?;
+
+    worker_msg_tx
+        .send(ReadFileResponse(content).into())
+        .await
+        .drop_error_details()
+        .context(UnableToSendWorkerMessageSnafu)
 }
 
 // Current working directory defaults to project dir unless specified otherwise.
@@ -225,10 +254,11 @@ async fn manage_processes(
 ) -> Result<()> {
     let mut processes = HashMap::new();
     let mut stdin_senders: HashMap<JobId, mpsc::Sender<String>> = HashMap::new();
+
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
-                let (cmd_id, req, response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+                let (Multiplexed(job_id, req), response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
                 let ExecuteCommandRequest {
                     cmd,
                     args,
@@ -247,15 +277,19 @@ async fn manage_processes(
 
                 // Preparing for receiving stdin packet.
                 let (stdin_tx, stdin_rx) = mpsc::channel(8);
-                stdin_senders.insert(cmd_id, stdin_tx);
+                stdin_senders.insert(job_id, stdin_tx);
 
-                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, cmd_id)?;
+                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, job_id)?;
                 task_set.spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
-                    response_tx.notify_one();
-                    Ok(())
+
+                    response_tx
+                        .send(ExecuteCommandResponse(()).into())
+                        .await
+                        .drop_error_details()
+                        .context(UnableToSendWorkerMessageSnafu)
                 });
-                processes.insert(cmd_id, task_set);
+                processes.insert(job_id, task_set);
             }
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
