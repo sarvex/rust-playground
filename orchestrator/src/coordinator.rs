@@ -20,8 +20,8 @@ use tokio_util::io::SyncIoBridge;
 
 use crate::{
     message::{
-        CoordinatorMessage, JobId, Multiplexed, OneToOneResponse, ReadFileResponse, WorkerMessage,
-        WriteFileRequest,
+        CoordinatorMessage, JobId, Multiplexed, OneToOneResponse, ReadFileRequest,
+        ReadFileResponse, WorkerMessage,
     },
     sandbox::{CompileRequest, CompileResponse, CompileResponse2},
     DropErrorDetailsExt, JoinSetExt,
@@ -40,15 +40,21 @@ pub struct Container {
 }
 
 impl Container {
-    pub async fn compile(&self, request: CompileRequest) -> Result<CompileResponse> {
-        let (result, stdout, stderr) = self.begin_compile(request).await?;
+    pub async fn compile(&self, request: CompileRequest) -> Result<CompileResponse, CompileError> {
+        use compile_error::*;
 
-        let stdout = ReceiverStream::new(stdout).collect();
-        let stderr = ReceiverStream::new(stderr).collect();
+        let ActiveCompilation {
+            task,
+            stdout_rx,
+            stderr_rx,
+        } = self.begin_compile(request).await?;
 
-        let (result, stdout, stderr) = join!(result, stdout, stderr);
+        let stdout = ReceiverStream::new(stdout_rx).collect();
+        let stderr = ReceiverStream::new(stderr_rx).collect();
 
-        let CompileResponse2 { success, code } = result.expect("handle me")?;
+        let (result, stdout, stderr) = join!(task, stdout, stderr);
+
+        let CompileResponse2 { success, code } = result.context(CompilationTaskPanickedSnafu)??;
         Ok(CompileResponse {
             success,
             code,
@@ -60,110 +66,46 @@ impl Container {
     pub async fn begin_compile(
         &self,
         request: CompileRequest,
-    ) -> Result<(
-        JoinHandle<Result<CompileResponse2>>, // TODO: shouldn't include stdout / stderr
-        mpsc::Receiver<String>,
-        mpsc::Receiver<String>,
-    )> {
-        let write_main = WriteFileRequest {
-            path: "src/main.rs".to_owned(),
-            content: request.code.into(),
-        };
+    ) -> Result<ActiveCompilation, CompileError> {
+        use compile_error::*;
 
-        use crate::message::{ExecuteCommandRequest, ReadFileRequest};
-        use crate::sandbox::{Channel, CompileTarget::*, Edition, Mode};
-
-        let edition = match request.edition {
-            Some(Edition::Rust2021) => "2021",
-            Some(Edition::Rust2018) => "2018",
-            Some(Edition::Rust2015) => "2015",
-            None => "2021",
-        };
-
-        let write_cargo_toml = WriteFileRequest {
-            path: "Cargo.toml".to_owned(),
-            content: format!(
-                r#"[package]
-                   name = "play"
-                   version = "0.1.0"
-                   edition = "{edition}"
-                   "#
-            )
-            .into(),
-        };
-
-        let mut args = if let Wasm = request.target {
-            vec!["wasm", "build"]
-        } else {
-            vec!["rustc"]
-        };
-        if let Mode::Release = request.mode {
-            args.push("--release");
-        }
         let output_path: &str = "compilation";
-        match request.target {
-            Assembly(flavor, _, _) => {
-                use crate::sandbox::AssemblyFlavor::*;
 
-                // TODO: No compile-time string formatting.
-                args.extend(&["--", "--emit", "asm=compilation"]);
-
-                // Enable extra assembly comments for nightly builds
-                if let Channel::Nightly = request.channel {
-                    args.push("-Z");
-                    args.push("asm-comments");
-                }
-
-                args.push("-C");
-                match flavor {
-                    Att => args.push("llvm-args=-x86-asm-syntax=att"),
-                    Intel => args.push("llvm-args=-x86-asm-syntax=intel"),
-                }
-            }
-            LlvmIr => args.extend(&["--", "--emit", "llvm-ir=compilation"]),
-            Mir => args.extend(&["--", "--emit", "mir=compilation"]),
-            Hir => args.extend(&["--", "-Zunpretty=hir", "-o", output_path]),
-            Wasm => args.extend(&["-o", output_path]),
-        }
-        let mut envs = HashMap::new();
-        if request.backtrace {
-            envs.insert("RUST_BACKTRACE".to_owned(), "1".to_owned());
-        }
-
-        let execute_cargo = ExecuteCommandRequest {
-            cmd: "cargo".to_owned(),
-            args: args.into_iter().map(|s| s.to_owned()).collect(),
-            envs,
-            cwd: None,
-        };
-
+        let write_main = request.write_main_request();
+        let write_cargo_toml = request.write_cargo_toml_request();
+        let execute_cargo = request.execute_cargo_request(output_path);
         let read_output = ReadFileRequest {
             path: output_path.to_owned(),
         };
 
-        let a = self.commander.one(write_main);
-        let b = self.commander.one(write_cargo_toml);
+        let write_main = self.commander.one(write_main);
+        let write_cargo_toml = self.commander.one(write_cargo_toml);
 
-        let (a, b) = join!(a, b);
-        a.unwrap();
-        b.unwrap();
+        let (write_main, write_cargo_toml) = join!(write_main, write_cargo_toml);
+
+        write_main.context(CouldNotWriteCodeSnafu)?;
+        write_cargo_toml.context(CouldNotWriteCargoTomlSnafu)?;
+
         // TODO: assert response success
 
         let (stdout_tx, stdout_rx) = mpsc::channel(8);
         let (stderr_tx, stderr_rx) = mpsc::channel(8);
 
-        let mut from_worker_rx = self.commander.many(execute_cargo).await.unwrap();
+        let mut from_worker_rx = self
+            .commander
+            .many(execute_cargo)
+            .await
+            .context(CouldNotStartCompilerSnafu)?;
 
-        let x = tokio::spawn({
+        let task = tokio::spawn({
             let commander = self.commander.clone();
             async move {
                 let mut success = false;
 
                 while let Some(container_msg) = from_worker_rx.recv().await {
                     match container_msg {
-                        WorkerMessage::WriteFile(..) => todo!("nah"),
-                        WorkerMessage::ReadFile(..) => todo!("nah"),
                         WorkerMessage::ExecuteCommand(..) => {
+                            // TODO: success should from the command response.
                             success = true;
                             break;
                         }
@@ -173,12 +115,15 @@ impl Container {
                         WorkerMessage::StderrPacket(packet) => {
                             stderr_tx.send(packet).await.ok(/* Receiver gone, that's OK */);
                         }
+                        _ => return UnexpectedMessageSnafu.fail(),
                     }
                 }
 
-                let f: ReadFileResponse = commander.one(read_output).await.unwrap();
-                let code = f.0;
-                let code = String::from_utf8(code).unwrap();
+                let file: ReadFileResponse = commander
+                    .one(read_output)
+                    .await
+                    .context(CouldNotReadCodeSnafu)?;
+                let code = String::from_utf8(file.0).context(CodeNotUtf8Snafu)?;
 
                 // TODO: Stop listening
 
@@ -186,8 +131,44 @@ impl Container {
             }
         });
 
-        Ok((x, stdout_rx, stderr_rx))
+        Ok(ActiveCompilation {
+            task,
+            stdout_rx,
+            stderr_rx,
+        })
     }
+}
+
+#[derive(Debug)]
+pub struct ActiveCompilation {
+    pub task: JoinHandle<Result<CompileResponse2, CompileError>>,
+    pub stdout_rx: mpsc::Receiver<String>,
+    pub stderr_rx: mpsc::Receiver<String>,
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum CompileError {
+    #[snafu(display("The compilation task panicked"))]
+    CompilationTaskPanicked { source: tokio::task::JoinError },
+
+    #[snafu(display("Could not write Cargo.toml"))]
+    CouldNotWriteCargoToml { source: CommanderError },
+
+    #[snafu(display("Could not write source code"))]
+    CouldNotWriteCode { source: CommanderError },
+
+    #[snafu(display("Could not start compiler"))]
+    CouldNotStartCompiler { source: CommanderError },
+
+    #[snafu(display("Received an unexpected message"))]
+    UnexpectedMessage,
+
+    #[snafu(display("Could not read the compilation output"))]
+    CouldNotReadCode { source: CommanderError },
+
+    #[snafu(display("The compilation output was not UTF-8"))]
+    CodeNotUtf8 { source: std::string::FromUtf8Error },
 }
 
 #[derive(Debug, Clone)]
@@ -312,7 +293,7 @@ impl Commander {
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
-enum CommanderError {
+pub enum CommanderError {
     #[snafu(display("Two listeners subscribed to job {job_id}"))]
     DuplicateDemultiplexerClient { job_id: JobId },
 
@@ -380,20 +361,8 @@ pub enum Error {
     #[snafu(display("Failed to send worker message through channel"))]
     UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
 
-    #[snafu(display("Failed to receive worker message through channel"))]
-    UnableToReceiveWorkerMessage,
-
     #[snafu(display("Failed to receive coordinator message through channel"))]
     UnableToReceiveCoordinatorMessage,
-
-    #[snafu(display("Failed to send worker response(job report) through channel"))]
-    UnableToSendJobReport,
-
-    #[snafu(display("PlaygroundMessage receiver ended unexpectedly"))]
-    PlaygroundMessageReceiverEnded,
-
-    #[snafu(display("WorkerMessage receiver ended unexpectedly"))]
-    WorkerMessageReceiverEnded,
 }
 
 macro_rules! docker_command {
@@ -525,6 +494,8 @@ mod tests {
         sandbox::{Channel, CompileRequest, CompileTarget, CrateType, Edition, Mode},
     };
 
+    use super::*;
+
     fn new_compile_request() -> CompileRequest {
         CompileRequest {
             target: CompileTarget::Mir,
@@ -540,7 +511,7 @@ mod tests {
 
     #[tokio::test]
     #[snafu::report]
-    async fn test_compile_response() -> super::Result<()> {
+    async fn test_compile_response() -> Result<()> {
         let project_dir =
             TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
@@ -551,7 +522,8 @@ mod tests {
             container.compile(new_compile_request()),
         )
         .await
-        .expect("Failed to receive streaming from container in time")?;
+        .expect("Failed to receive streaming from container in time")
+        .unwrap();
 
         assert!(response.success);
 
@@ -560,23 +532,30 @@ mod tests {
 
     #[tokio::test]
     #[snafu::report]
-    async fn test_compile_streaming() -> super::Result<()> {
+    async fn test_compile_streaming() -> Result<()> {
         let project_dir =
             TempDir::new("playground").expect("Failed to create temporary project directory");
         let mut coordinator = Coordinator::new(project_dir.path());
 
         let container = coordinator.allocate()?;
-        let (complete, stdout, stderr) = container.begin_compile(new_compile_request()).await?;
+        let ActiveCompilation {
+            task,
+            stdout_rx,
+            stderr_rx,
+        } = container
+            .begin_compile(new_compile_request())
+            .await
+            .unwrap();
 
-        let stdout = ReceiverStream::new(stdout);
+        let stdout = ReceiverStream::new(stdout_rx);
         let stdout = stdout.collect::<String>();
 
-        let stderr = ReceiverStream::new(stderr);
+        let stderr = ReceiverStream::new(stderr_rx);
         let stderr = stderr.collect::<String>();
 
         let (_complete, _stdout, stderr) =
             tokio::time::timeout(Duration::from_millis(5000), async move {
-                join!(complete, stdout, stderr)
+                join!(task, stdout, stderr)
             })
             .await
             .expect("Failed to receive streaming from container in time");
