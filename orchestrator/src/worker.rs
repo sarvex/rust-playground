@@ -11,16 +11,15 @@ use tokio::{
     process::{Child, Command},
     select,
     sync::{mpsc, Notify},
-    task::{JoinHandle, JoinSet},
+    task::JoinSet,
 };
 
 use crate::message::{
-    CommandId, CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, JobReport,
-    ReadFileRequest, ReadFileResponse, Request, Response, WorkerMessage, WriteFileRequest,
-    WriteFileResponse,
+    CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
+    ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
 };
 
-type CommandRequest = (CommandId, ExecuteCommandRequest, Arc<Notify>);
+type CommandRequest = (JobId, ExecuteCommandRequest, Arc<Notify>);
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -32,8 +31,11 @@ pub enum Error {
     #[snafu(display("Failed to write file"))]
     UnableToWriteFile { source: std::io::Error },
 
-    #[snafu(display("Failed to read file"))]
-    UnableToReadFile { source: std::io::Error },
+    #[snafu(display("Failed to read file {}", path.display()))]
+    UnableToReadFile {
+        source: std::io::Error,
+        path: PathBuf,
+    },
 
     #[snafu(display("Failed to send command execution request"))]
     UnableToSendCommandExecutionRequest {
@@ -77,17 +79,17 @@ pub enum Error {
 
     #[snafu(display("Failed to send stdin packet"))]
     UnableToSendStdinPacket {
-        source: mpsc::error::SendError<(CommandId, String)>,
+        source: mpsc::error::SendError<Multiplexed<String>>,
     },
 
     #[snafu(display("Failed to send stdout packet"))]
     UnableToSendStdoutPacket {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
     },
 
     #[snafu(display("Failed to send stderr packet"))]
     UnableToSendStderrPacket {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
     },
 
     #[snafu(display("Failed to wait for child process exiting"))]
@@ -95,7 +97,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send coordinator message from deserialization task"))]
     UnableToSendCoordinatorMessage {
-        source: mpsc::error::SendError<CoordinatorMessage>,
+        source: mpsc::error::SendError<Multiplexed<CoordinatorMessage>>,
     },
 
     #[snafu(display("Failed to receive coordinator message from deserialization task"))]
@@ -103,7 +105,7 @@ pub enum Error {
 
     #[snafu(display("Failed to send worker message to serialization task"))]
     UnableToSendWorkerMessage {
-        source: mpsc::error::SendError<WorkerMessage>,
+        source: mpsc::error::SendError<Multiplexed<WorkerMessage>>,
     },
 
     #[snafu(display("Failed to receive worker message"))]
@@ -137,57 +139,67 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
         project_dir.clone(),
     ));
     tasks.spawn(async move {
-        // TODO: may change this to a hashmap to allow multiple concurrent jobs.
-        let mut current_job: Option<JoinHandle<Result<()>>> = None;
-
         let project_path = project_dir.as_path();
         loop {
             let coordinator_msg = coordinator_msg_rx
                 .recv()
                 .await
                 .context(UnableToReceiveCoordinatorMessageSnafu)?;
+
+            let Multiplexed(job_id, coordinator_msg) = coordinator_msg;
+
             match coordinator_msg {
-                CoordinatorMessage::Request(job_id, job) => {
-                    if let Some(current_job) = current_job {
-                        current_job.abort();
-                    }
+                CoordinatorMessage::WriteFile(WriteFileRequest { path, content }) => {
+                    let path = parse_working_dir(Some(path), project_path);
 
-                    let worker_msg_tx = worker_msg_tx.clone();
-                    let cmd_tx = cmd_tx.clone();
-                    let project_path = project_path.to_path_buf();
-
-                    let task_handle = tokio::spawn(async move {
-                        let mut all_responses = Vec::new();
-                        for (operation_id, req) in job.reqs.into_iter().enumerate() {
-                            let resp = handle_request(
-                                req,
-                                project_path.as_path(),
-                                cmd_tx.clone(),
-                                job_id,
-                                operation_id as u64,
-                            )
-                            .await;
-                            let success = resp.is_ok();
-                            all_responses.push(resp.into());
-                            if !success {
-                                break;
-                            }
-                        }
-                        let job_report = JobReport {
-                            resps: all_responses,
-                        };
-                        worker_msg_tx
-                            .send(WorkerMessage::Response(job_id, job_report))
+                    // Create intermediate directories.
+                    if let Some(parent_dir) = path.parent() {
+                        fs::create_dir_all(parent_dir)
                             .await
-                            .context(UnableToSendWorkerMessageSnafu)?;
-                        Ok(())
-                    });
+                            .context(UnableToCreateDirSnafu)?;
+                    }
+                    fs::write(path, content)
+                        .await
+                        .context(UnableToWriteFileSnafu)?;
 
-                    current_job = Some(task_handle);
+                    worker_msg_tx
+                        .send(Multiplexed(job_id, WriteFileResponse(()).into()))
+                        .await
+                        .context(UnableToSendWorkerMessageSnafu)?;
                 }
-                CoordinatorMessage::StdinPacket(cmd_id, data) => {
+
+                CoordinatorMessage::ReadFile(ReadFileRequest { path }) => {
+                    // TODO: spawn
+
+                    let path = parse_working_dir(Some(path), project_path);
+                    let content = fs::read(&path)
+                        .await
+                        .context(UnableToReadFileSnafu { path })?;
+
+                    worker_msg_tx
+                        .send(Multiplexed(job_id, ReadFileResponse(content).into()))
+                        .await
+                        .context(UnableToSendWorkerMessageSnafu)?;
+                }
+
+                CoordinatorMessage::ExecuteCommand(cmd) => {
+                    // TODO: spawn
+                    let notify = Arc::new(Notify::new());
+                    cmd_tx
+                        .send((job_id, cmd, notify.clone()))
+                        .await
+                        .context(UnableToSendCommandExecutionRequestSnafu)?;
+                    notify.notified().await;
+
+                    worker_msg_tx
+                        .send(Multiplexed(job_id, ExecuteCommandResponse(()).into()))
+                        .await
+                        .context(UnableToSendWorkerMessageSnafu)?;
+                }
+
+                CoordinatorMessage::StdinPacket(data) => {
                     stdin_tx
-                        .send((cmd_id, data))
+                        .send(Multiplexed(job_id, data))
                         .await
                         .context(UnableToSendStdinPacketSnafu)?;
                 }
@@ -211,52 +223,14 @@ fn parse_working_dir(cwd: Option<String>, project_path: &Path) -> PathBuf {
     final_path
 }
 
-async fn handle_request(
-    req: Request,
-    project_path: &Path,
-    cmd_tx: mpsc::Sender<CommandRequest>,
-    job_id: JobId,
-    operation_id: u64,
-) -> Result<Response> {
-    match req {
-        Request::WriteFile(WriteFileRequest { path, content }) => {
-            let path = parse_working_dir(Some(path), project_path);
-            // Create intermediate directories.
-            if let Some(parent_dir) = path.parent() {
-                fs::create_dir_all(parent_dir)
-                    .await
-                    .context(UnableToCreateDirSnafu)?;
-            }
-            fs::write(path, content)
-                .await
-                .context(UnableToWriteFileSnafu)?;
-            Ok(Response::WriteFile(WriteFileResponse(())))
-        }
-        Request::ReadFile(ReadFileRequest { path }) => {
-            let path = parse_working_dir(Some(path), project_path);
-            let content = fs::read(path).await.context(UnableToReadFileSnafu)?;
-            Ok(Response::ReadFile(ReadFileResponse(content)))
-        }
-        Request::ExecuteCommand(cmd) => {
-            let notify = Arc::new(Notify::new());
-            cmd_tx
-                .send(((job_id, operation_id), cmd, notify.clone()))
-                .await
-                .context(UnableToSendCommandExecutionRequestSnafu)?;
-            notify.notified().await;
-            Ok(Response::ExecuteCommand(ExecuteCommandResponse(())))
-        }
-    }
-}
-
 async fn manage_processes(
-    worker_msg_tx: mpsc::Sender<WorkerMessage>,
-    mut stdin_rx: mpsc::Receiver<(CommandId, String)>,
+    worker_msg_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
+    mut stdin_rx: mpsc::Receiver<Multiplexed<String>>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     project_path: PathBuf,
 ) -> Result<()> {
     let mut processes = HashMap::new();
-    let mut stdin_senders: HashMap<(u64, u64), mpsc::Sender<String>> = HashMap::new();
+    let mut stdin_senders: HashMap<JobId, mpsc::Sender<String>> = HashMap::new();
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
@@ -291,8 +265,8 @@ async fn manage_processes(
             }
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
-                let (cmd_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
-                if let Some(stdin_tx) = stdin_senders.get(&cmd_id) {
+                let Multiplexed(job_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
+                if let Some(stdin_tx) = stdin_senders.get(&job_id) {
                     stdin_tx.send(packet).await.context(UnableToSendStdinDataSnafu)?;
                 }
             }
@@ -301,10 +275,10 @@ async fn manage_processes(
 }
 
 fn stream_stdio(
-    coordinator_tx: mpsc::Sender<WorkerMessage>,
+    coordinator_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
     mut stdin_rx: mpsc::Receiver<String>,
     child: &mut Child,
-    cmd_id: CommandId,
+    job_id: JobId,
 ) -> Result<JoinSet<Result<()>>> {
     let mut stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
     let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
@@ -337,7 +311,7 @@ fn stream_stdio(
                 .context(UnableToReadStdoutSnafu)?;
             if n != 0 {
                 coordinator_tx_out
-                    .send(WorkerMessage::StdoutPacket(cmd_id, buffer))
+                    .send(Multiplexed(job_id, WorkerMessage::StdoutPacket(buffer)))
                     .await
                     .context(UnableToSendStdoutPacketSnafu)?;
             } else {
@@ -358,7 +332,7 @@ fn stream_stdio(
                 .context(UnableToReadStderrSnafu)?;
             if n != 0 {
                 coordinator_tx_err
-                    .send(WorkerMessage::StderrPacket(cmd_id, buffer))
+                    .send(Multiplexed(job_id, WorkerMessage::StderrPacket(buffer)))
                     .await
                     .context(UnableToSendStderrPacketSnafu)?;
             } else {
@@ -373,8 +347,8 @@ fn stream_stdio(
 // stdin/out <--> messages.
 fn spawn_io_queue(
     tasks: &mut JoinSet<Result<()>>,
-    coordinator_msg_tx: mpsc::Sender<CoordinatorMessage>,
-    mut worker_msg_rx: mpsc::Receiver<WorkerMessage>,
+    coordinator_msg_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
+    mut worker_msg_rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
 
