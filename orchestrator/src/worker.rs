@@ -27,89 +27,26 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("Failed to create directories"))]
-    UnableToCreateDir { source: std::io::Error },
+    UnableToWriteFile {
+        source: WriteFileError,
+    },
 
-    #[snafu(display("Failed to write file"))]
-    UnableToWriteFile { source: std::io::Error },
-
-    #[snafu(display("Failed to read file {}", path.display()))]
     UnableToReadFile {
-        source: std::io::Error,
-        path: PathBuf,
+        source: ReadFileError,
     },
 
     #[snafu(display("Failed to send command execution request"))]
-    UnableToSendCommandExecutionRequest { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to spawn child process"))]
-    UnableToSpawnProcess { source: std::io::Error },
-
-    #[snafu(display("Failed to capture child process stdin"))]
-    UnableToCaptureStdin,
-
-    #[snafu(display("Failed to capture child process stdout"))]
-    UnableToCaptureStdout,
-
-    #[snafu(display("Failed to capture child process stderr"))]
-    UnableToCaptureStderr,
-
-    #[snafu(display("Failed to send stdin data"))]
-    UnableToSendStdinData { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to receive stdin data"))]
-    UnableToReceiveStdinData,
-
-    #[snafu(display("Failed to write stdin data"))]
-    UnableToWriteStdin { source: std::io::Error },
-
-    #[snafu(display("Failed to flush stdin data"))]
-    UnableToFlushStdin { source: std::io::Error },
-
-    #[snafu(display("Failed to read child process stdout"))]
-    UnableToReadStdout { source: std::io::Error },
-
-    #[snafu(display("Failed to read child process stderr"))]
-    UnableToReadStderr { source: std::io::Error },
-
-    #[snafu(display("Failed to flush stdout"))]
-    UnableToFlushStdout { source: std::io::Error },
+    UnableToSendCommandExecutionRequest {
+        source: mpsc::error::SendError<()>,
+    },
 
     #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to send stdout packet"))]
-    UnableToSendStdoutPacket { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to send stderr packet"))]
-    UnableToSendStderrPacket { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to wait for child process exiting"))]
-    WaitChild { source: std::io::Error },
-
-    #[snafu(display("Failed to send coordinator message from deserialization task"))]
-    UnableToSendCoordinatorMessage { source: mpsc::error::SendError<()> },
+    UnableToSendStdinPacket {
+        source: mpsc::error::SendError<()>,
+    },
 
     #[snafu(display("Failed to receive coordinator message from deserialization task"))]
     UnableToReceiveCoordinatorMessage,
-
-    #[snafu(display("Failed to send worker message to serialization task"))]
-    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to receive worker message"))]
-    UnableToReceiveWorkerMessage,
-
-    #[snafu(display("Failed to deserialize coordinator message"))]
-    UnableToDeserializeCoordinatorMessage { source: bincode::Error },
-
-    #[snafu(display("Failed to serialize worker message"))]
-    UnableToSerializeWorkerMessage { source: bincode::Error },
-
-    #[snafu(display("Command request recevier ended unexpectedly"))]
-    CommandRequestReceiverEnded,
-
-    #[snafu(display("Stdin packet recevier ended unexpectedly"))]
-    StdinReceiverEnded,
 }
 
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
@@ -128,7 +65,8 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
         project_dir.clone(),
     ));
 
-    tasks.spawn(async move {
+    // TODO: watch this
+    tokio::spawn(async move {
         let mut msg_tasks = JoinSet::new(); // TODO check this
 
         loop {
@@ -144,16 +82,22 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
 
             match coordinator_msg {
                 CoordinatorMessage::WriteFile(req) => {
-                    msg_tasks.spawn(handle_write_file(req, project_dir.clone(), worker_msg_tx()));
+                    msg_tasks.spawn({
+                        handle_write_file(req, project_dir.clone(), worker_msg_tx())
+                            .context(UnableToWriteFileSnafu)
+                    });
                 }
 
                 CoordinatorMessage::ReadFile(req) => {
-                    msg_tasks.spawn(handle_read_file(req, project_dir.clone(), worker_msg_tx()));
+                    msg_tasks.spawn({
+                        handle_read_file(req, project_dir.clone(), worker_msg_tx())
+                            .context(UnableToReadFileSnafu)
+                    });
                 }
 
-                CoordinatorMessage::ExecuteCommand(cmd) => {
+                CoordinatorMessage::ExecuteCommand(req) => {
                     cmd_tx
-                        .send((Multiplexed(job_id, cmd), worker_msg_tx()))
+                        .send((Multiplexed(job_id, req), worker_msg_tx()))
                         .await
                         .drop_error_details()
                         .context(UnableToSendCommandExecutionRequestSnafu)?;
@@ -168,6 +112,8 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
                 }
             }
         }
+
+        <Result<_>>::Ok(())
     });
 
     // Shutdown when any of these critical tasks goes wrong.
@@ -192,24 +138,25 @@ impl MultiplexingSender {
     }
 }
 
-// TODO: smaller errors?
 async fn handle_write_file(
     req: WriteFileRequest,
     project_dir: PathBuf,
     worker_msg_tx: MultiplexingSender,
-) -> Result<()> {
+) -> Result<(), WriteFileError> {
+    use write_file_error::*;
+
     let path = parse_working_dir(Some(req.path), &project_dir);
 
     // Create intermediate directories.
     if let Some(parent_dir) = path.parent() {
         fs::create_dir_all(parent_dir)
             .await
-            .context(UnableToCreateDirSnafu)?;
+            .context(UnableToCreateDirSnafu { parent_dir })?;
     }
 
-    fs::write(path, req.content)
+    fs::write(&path, req.content)
         .await
-        .context(UnableToWriteFileSnafu)?;
+        .context(UnableToWriteFileSnafu { path })?;
 
     worker_msg_tx
         .send(WriteFileResponse(()).into())
@@ -218,11 +165,32 @@ async fn handle_write_file(
         .context(UnableToSendWorkerMessageSnafu)
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum WriteFileError {
+    #[snafu(display("Failed to create parent directory {}", parent_dir.display()))]
+    UnableToCreateDir {
+        source: std::io::Error,
+        parent_dir: PathBuf,
+    },
+
+    #[snafu(display("Failed to write file {}", path.display()))]
+    UnableToWriteFile {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Failed to send worker message to serialization task"))]
+    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
+}
+
 async fn handle_read_file(
     req: ReadFileRequest,
     project_dir: PathBuf,
     worker_msg_tx: MultiplexingSender,
-) -> Result<()> {
+) -> Result<(), ReadFileError> {
+    use read_file_error::*;
+
     let path = parse_working_dir(Some(req.path), &project_dir);
 
     let content = fs::read(&path)
@@ -234,6 +202,19 @@ async fn handle_read_file(
         .await
         .drop_error_details()
         .context(UnableToSendWorkerMessageSnafu)
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ReadFileError {
+    #[snafu(display("Failed to read file {}", path.display()))]
+    UnableToReadFile {
+        source: std::io::Error,
+        path: PathBuf,
+    },
+
+    #[snafu(display("Failed to send worker message to serialization task"))]
+    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
 }
 
 // Current working directory defaults to project dir unless specified otherwise.
@@ -251,7 +232,9 @@ async fn manage_processes(
     mut stdin_rx: mpsc::Receiver<Multiplexed<String>>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     project_path: PathBuf,
-) -> Result<()> {
+) -> Result<(), ProcessError> {
+    use process_error::*;
+
     let mut processes = HashMap::new();
     let mut stdin_senders: HashMap<JobId, mpsc::Sender<String>> = HashMap::new();
 
@@ -279,8 +262,9 @@ async fn manage_processes(
                 let (stdin_tx, stdin_rx) = mpsc::channel(8);
                 stdin_senders.insert(job_id, stdin_tx);
 
-                let mut task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, job_id)?;
-                task_set.spawn(async move {
+                let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, job_id).context(StdioSnafu)?;
+                // TODO: watch this spawn
+                tokio::spawn(async move {
                     child.wait().await.context(WaitChildSnafu)?;
 
                     response_tx
@@ -302,12 +286,48 @@ async fn manage_processes(
     }
 }
 
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum ProcessError {
+    #[snafu(display("Failed to spawn child process"))]
+    UnableToSpawnProcess {
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Command request receiver ended unexpectedly"))]
+    CommandRequestReceiverEnded,
+
+    #[snafu(display("Stdin packet receiver ended unexpectedly"))]
+    StdinReceiverEnded,
+
+    #[snafu(display("Failed to send stdin data"))]
+    UnableToSendStdinData {
+        source: mpsc::error::SendError<()>,
+    },
+
+    Stdio {
+        source: StdioError,
+    },
+
+    #[snafu(display("Failed to wait for child process exiting"))]
+    WaitChild {
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Failed to send worker message to serialization task"))]
+    UnableToSendWorkerMessage {
+        source: mpsc::error::SendError<()>,
+    },
+}
+
 fn stream_stdio(
     coordinator_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
     mut stdin_rx: mpsc::Receiver<String>,
     child: &mut Child,
     job_id: JobId,
-) -> Result<JoinSet<Result<()>>> {
+) -> Result<JoinSet<Result<(), StdioError>>, StdioError> {
+    use stdio_error::*;
+
     let mut stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
     let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
     let stderr = child.stderr.take().context(UnableToCaptureStderrSnafu)?;
@@ -327,6 +347,7 @@ fn stream_stdio(
             stdin.flush().await.context(UnableToFlushStdinSnafu)?;
         }
     });
+
     let coordinator_tx_out = coordinator_tx.clone();
     set.spawn(async move {
         let mut stdout_buf = BufReader::new(stdout);
@@ -349,6 +370,7 @@ fn stream_stdio(
         }
         Ok(())
     });
+
     let coordinator_tx_err = coordinator_tx;
     set.spawn(async move {
         let mut stderr_buf = BufReader::new(stderr);
@@ -371,15 +393,51 @@ fn stream_stdio(
         }
         Ok(())
     });
+
     Ok(set)
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum StdioError {
+    #[snafu(display("Failed to capture child process stdin"))]
+    UnableToCaptureStdin,
+
+    #[snafu(display("Failed to capture child process stdout"))]
+    UnableToCaptureStdout,
+
+    #[snafu(display("Failed to capture child process stderr"))]
+    UnableToCaptureStderr,
+
+    #[snafu(display("Failed to receive stdin data"))]
+    UnableToReceiveStdinData,
+
+    #[snafu(display("Failed to write stdin data"))]
+    UnableToWriteStdin { source: std::io::Error },
+
+    #[snafu(display("Failed to flush stdin data"))]
+    UnableToFlushStdin { source: std::io::Error },
+
+    #[snafu(display("Failed to read child process stdout"))]
+    UnableToReadStdout { source: std::io::Error },
+
+    #[snafu(display("Failed to read child process stderr"))]
+    UnableToReadStderr { source: std::io::Error },
+
+    #[snafu(display("Failed to send stdout packet"))]
+    UnableToSendStdoutPacket { source: mpsc::error::SendError<()> },
+
+    #[snafu(display("Failed to send stderr packet"))]
+    UnableToSendStderrPacket { source: mpsc::error::SendError<()> },
 }
 
 // stdin/out <--> messages.
 fn spawn_io_queue(
-    tasks: &mut JoinSet<Result<()>>,
+    tasks: &mut JoinSet<Result<(), IoQueueError>>,
     coordinator_msg_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
     mut worker_msg_rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
 ) {
+    use io_queue_error::*;
     use std::io::{prelude::*, BufReader, BufWriter};
 
     tasks.spawn_blocking(move || {
@@ -412,4 +470,23 @@ fn spawn_io_queue(
             stdout.flush().context(UnableToFlushStdoutSnafu)?;
         }
     });
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum IoQueueError {
+    #[snafu(display("Failed to deserialize coordinator message"))]
+    UnableToDeserializeCoordinatorMessage { source: bincode::Error },
+
+    #[snafu(display("Failed to serialize worker message"))]
+    UnableToSerializeWorkerMessage { source: bincode::Error },
+
+    #[snafu(display("Failed to send coordinator message from deserialization task"))]
+    UnableToSendCoordinatorMessage { source: mpsc::error::SendError<()> },
+
+    #[snafu(display("Failed to receive worker message"))]
+    UnableToReceiveWorkerMessage,
+
+    #[snafu(display("Failed to flush stdout"))]
+    UnableToFlushStdout { source: std::io::Error },
 }
