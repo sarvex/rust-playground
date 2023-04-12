@@ -14,13 +14,12 @@ use tokio::{
     task::JoinSet,
 };
 
-use crate::DropErrorDetailsExt;
 use crate::{
     message::{
         CoordinatorMessage, ExecuteCommandRequest, ExecuteCommandResponse, JobId, Multiplexed,
         ReadFileRequest, ReadFileResponse, WorkerMessage, WriteFileRequest, WriteFileResponse,
     },
-    JoinSetExt,
+    DropErrorDetailsExt, JoinSetExt,
 };
 
 type CommandRequest = (JobId, ExecuteCommandRequest, Arc<Notify>);
