@@ -89,9 +89,6 @@ pub struct ExecuteCommandRequest {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ExecuteCommandResponse(pub ());
 
-#[derive(Debug, Serialize, Deserialize)]
-pub struct StreamCommandResponse(pub ());
-
 pub trait OneToOneResponse {
     type Response;
 }
