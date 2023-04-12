@@ -145,13 +145,14 @@ impl Container {
         let b = self.commander.one(write_cargo_toml);
 
         let (a, b) = join!(a, b);
-
+        a.unwrap();
+        b.unwrap();
         // TODO: assert response success
 
         let (stdout_tx, stdout_rx) = mpsc::channel(8);
         let (stderr_tx, stderr_rx) = mpsc::channel(8);
 
-        let mut from_worker_rx = self.commander.many(execute_cargo).await;
+        let mut from_worker_rx = self.commander.many(execute_cargo).await.unwrap();
 
         let x = tokio::spawn({
             let commander = self.commander.clone();
@@ -175,7 +176,7 @@ impl Container {
                     }
                 }
 
-                let f: ReadFileResponse = commander.one(read_output).await;
+                let f: ReadFileResponse = commander.one(read_output).await.unwrap();
                 let code = f.0;
                 let code = String::from_utf8(code).unwrap();
 
@@ -192,47 +193,48 @@ impl Container {
 #[derive(Debug, Clone)]
 struct Commander {
     to_worker_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
-    command_tx: mpsc::Sender<DemultiplexCommand>,
+    to_demultiplexer_tx: mpsc::Sender<DemultiplexCommand>,
     id: Arc<AtomicU64>,
 }
 
 impl Commander {
     async fn demultiplex(
         mut command_rx: mpsc::Receiver<DemultiplexCommand>,
-        mut rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
-    ) {
+        mut from_worker_rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
+    ) -> Result<(), CommanderError> {
+        use commander_error::*;
+
         let mut waiting = HashMap::new();
         let mut waiting_once = HashMap::new();
 
         loop {
             select! {
                 command = command_rx.recv() => {
-                    let command = command.expect("Handle this");
+                    let Some(command) = command else { return Ok(()) };
+
                     match command {
-                        DemultiplexCommand::Listen(id, waiter) => {
-                            waiting.insert(id, waiter);
-                            // TODO: ensure not replacing
+                        DemultiplexCommand::Listen(job_id, waiter) => {
+                            let old = waiting.insert(job_id, waiter);
+                            ensure!(old.is_none(), DuplicateDemultiplexerClientSnafu { job_id });
                         }
 
-                        DemultiplexCommand::ListenOnce(id, waiter) => {
-                            waiting_once.insert(id, waiter);
-                            // TODO: ensure not replacing
+                        DemultiplexCommand::ListenOnce(job_id, waiter) => {
+                            let old = waiting_once.insert(job_id, waiter);
+                            ensure!(old.is_none(), DuplicateDemultiplexerClientSnafu { job_id });
                         }
                     }
                 },
 
-                msg = rx.recv() => {
-                    let msg = msg.expect("Handle this");
+                msg = from_worker_rx.recv() => {
+                    let Multiplexed(job_id, msg) = msg.context(UnableToReceiveFromWorkerSnafu)?;
 
-                    let Multiplexed(id, data) = msg; // TODO: some uniform way of getting the ID for _any_ message
-
-                    if let Some(waiter) = waiting_once.remove(&id) {
-                        waiter.send(data).ok(/* Don't care about it */);
+                    if let Some(waiter) = waiting_once.remove(&job_id) {
+                        waiter.send(msg).ok(/* Don't care about it */);
                         continue;
                     }
 
-                    if let Some(waiter) = waiting.get(&id) {
-                        waiter.send(data).await.ok(/* Don't care about it */);
+                    if let Some(waiter) = waiting.get(&job_id) {
+                        waiter.send(msg).await.ok(/* Don't care about it */);
                         continue;
                     }
 
@@ -246,50 +248,88 @@ impl Commander {
         self.id.fetch_add(1, Ordering::SeqCst)
     }
 
-    async fn one<M>(&self, message: M) -> M::Response
+    async fn send_to_demultiplexer(
+        &self,
+        command: DemultiplexCommand,
+    ) -> Result<(), CommanderError> {
+        use commander_error::*;
+
+        self.to_demultiplexer_tx
+            .send(command)
+            .await
+            .drop_error_details()
+            .context(UnableToSendToDemultiplexerSnafu)
+    }
+
+    async fn send_to_worker(
+        &self,
+        message: Multiplexed<CoordinatorMessage>,
+    ) -> Result<(), CommanderError> {
+        use commander_error::*;
+
+        self.to_worker_tx
+            .send(message)
+            .await
+            .drop_error_details()
+            .context(UnableToSendToWorkerSnafu)
+    }
+
+    async fn one<M>(&self, message: M) -> Result<M::Response, CommanderError>
     where
         M: Into<CoordinatorMessage>,
         M: OneToOneResponse,
         M::Response: TryFrom<WorkerMessage>,
     {
+        use commander_error::*;
+
         let id = self.next_id();
+        let (from_demultiplexer_tx, from_demultiplexer_rx) = oneshot::channel();
 
-        let (from_worker_tx, from_worker_rx) = oneshot::channel();
-
-        self.command_tx
-            .send(DemultiplexCommand::ListenOnce(id, from_worker_tx))
+        self.send_to_demultiplexer(DemultiplexCommand::ListenOnce(id, from_demultiplexer_tx))
+            .await?;
+        self.send_to_worker(Multiplexed(id, message.into())).await?;
+        let msg = from_demultiplexer_rx
             .await
-            .unwrap();
+            .context(UnableToReceiveFromDemultiplexerSnafu)?;
 
-        self.to_worker_tx
-            .send(Multiplexed(id, message.into()))
-            .await
-            .unwrap();
-
-        let msg = from_worker_rx.await.unwrap();
-        msg.try_into().ok().unwrap()
+        msg.try_into().ok().context(UnexpectedResponseTypeSnafu)
     }
 
-    async fn many<M>(&self, message: M) -> mpsc::Receiver<WorkerMessage>
+    async fn many<M>(&self, message: M) -> Result<mpsc::Receiver<WorkerMessage>, CommanderError>
     where
         M: Into<CoordinatorMessage>,
     {
         let id = self.next_id();
-
         let (from_worker_tx, from_worker_rx) = mpsc::channel(8);
 
-        self.command_tx
-            .send(DemultiplexCommand::Listen(id, from_worker_tx))
-            .await
-            .unwrap();
+        self.send_to_demultiplexer(DemultiplexCommand::Listen(id, from_worker_tx))
+            .await?;
+        self.send_to_worker(Multiplexed(id, message.into())).await?;
 
-        self.to_worker_tx
-            .send(Multiplexed(id, message.into()))
-            .await
-            .unwrap();
-
-        from_worker_rx
+        Ok(from_worker_rx)
     }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+enum CommanderError {
+    #[snafu(display("Two listeners subscribed to job {job_id}"))]
+    DuplicateDemultiplexerClient { job_id: JobId },
+
+    #[snafu(display("Could not send a message to the demultiplexer"))]
+    UnableToSendToDemultiplexer { source: mpsc::error::SendError<()> },
+
+    #[snafu(display("Did not receive a response from the demultiplexer"))]
+    UnableToReceiveFromDemultiplexer { source: oneshot::error::RecvError },
+
+    #[snafu(display("Could not send a message to the worker"))]
+    UnableToSendToWorker { source: mpsc::error::SendError<()> },
+
+    #[snafu(display("Did not receive a response from the worker"))]
+    UnableToReceiveFromWorker,
+
+    #[snafu(display("Did not receive the expected response type from the worker"))]
+    UnexpectedResponseType,
 }
 
 #[derive(Debug)]
@@ -474,7 +514,7 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
 
     let commander = Commander {
         to_worker_tx,
-        command_tx,
+        to_demultiplexer_tx: command_tx,
         id: Default::default(),
     };
 
