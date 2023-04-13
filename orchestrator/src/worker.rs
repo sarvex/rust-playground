@@ -496,7 +496,7 @@ fn stream_stdio(
             }
 
             coordinator_tx_out
-                .send(<Result<_>>::Ok(WorkerMessage::StdoutPacket(buffer)))
+                .send_ok(WorkerMessage::StdoutPacket(buffer))
                 .await
                 .context(UnableToSendStdoutPacketSnafu)?;
         }
@@ -519,7 +519,7 @@ fn stream_stdio(
             }
 
             coordinator_tx_err
-                .send(<Result<_>>::Ok(WorkerMessage::StderrPacket(buffer)))
+                .send_ok(WorkerMessage::StderrPacket(buffer))
                 .await
                 .context(UnableToSendStderrPacketSnafu)?;
         }
