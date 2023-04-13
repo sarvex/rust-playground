@@ -98,10 +98,7 @@ async fn handle_coordinator_message(
     let mut msg_tasks = JoinSet::new();
 
     loop {
-        let Multiplexed(job_id, coordinator_msg) = coordinator_msg_rx
-            .recv()
-            .await
-            .context(UnableToReceiveCoordinatorMessageSnafu)?;
+        let Some(Multiplexed(job_id, coordinator_msg)) = coordinator_msg_rx.recv().await else { break };
 
         let worker_msg_tx = || MultiplexingSender {
             job_id,
@@ -150,14 +147,13 @@ async fn handle_coordinator_message(
             }
         }
     }
+
+    Ok(())
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum HandleCoordinatorMessageError {
-    #[snafu(display("Failed to receive coordinator message from deserialization task"))]
-    UnableToReceiveCoordinatorMessage,
-
     UnableToSendWriteFileResponse {
         source: MultiplexingSenderError,
     },
@@ -317,7 +313,7 @@ async fn manage_processes(
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
-                let (Multiplexed(job_id, req), worker_msg_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
+                let Some((Multiplexed(job_id, req), worker_msg_tx)) = cmd_req else { break };
 
                 let (child, stdin_rx, stdin, stdout, stderr) = match process_begin(req, &project_path, &mut stdin_senders, job_id) {
                     Ok(v) => v,
@@ -360,6 +356,8 @@ async fn manage_processes(
             }
         }
     }
+
+    Ok(())
 }
 
 fn process_begin(
@@ -448,9 +446,6 @@ pub enum ProcessError {
 
     #[snafu(display("Failed to capture child process stderr"))]
     UnableToCaptureStderr,
-
-    #[snafu(display("Command request receiver ended unexpectedly"))]
-    CommandRequestReceiverEnded,
 
     #[snafu(display("Stdin packet receiver ended unexpectedly"))]
     StdinReceiverEnded,
