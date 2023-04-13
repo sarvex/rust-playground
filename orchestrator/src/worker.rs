@@ -237,7 +237,7 @@ async fn handle_write_file(
 ) -> Result<WriteFileResponse, WriteFileError> {
     use write_file_error::*;
 
-    let path = parse_working_dir(Some(req.path), &project_dir);
+    let path = parse_working_dir(Some(req.path), project_dir);
 
     // Create intermediate directories.
     if let Some(parent_dir) = path.parent() {
@@ -278,7 +278,7 @@ async fn handle_read_file(
 ) -> Result<ReadFileResponse, ReadFileError> {
     use read_file_error::*;
 
-    let path = parse_working_dir(Some(req.path), &project_dir);
+    let path = parse_working_dir(Some(req.path), project_dir);
 
     let content = fs::read(&path)
         .await
@@ -301,8 +301,8 @@ pub enum ReadFileError {
 }
 
 // Current working directory defaults to project dir unless specified otherwise.
-fn parse_working_dir(cwd: Option<String>, project_path: &Path) -> PathBuf {
-    let mut final_path = project_path.to_path_buf();
+fn parse_working_dir(cwd: Option<String>, project_path: impl Into<PathBuf>) -> PathBuf {
+    let mut final_path = project_path.into();
     if let Some(path) = cwd {
         // Absolute path will replace final_path.
         final_path.push(path)
