@@ -7,7 +7,7 @@ use std::{
 use tokio::{
     fs,
     io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
-    process::{Child, Command},
+    process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     select,
     sync::mpsc,
     task::JoinSet,
@@ -59,12 +59,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (stdin_tx, stdin_rx) = mpsc::channel(8);
-    tokio::spawn(manage_processes(
-        worker_msg_tx.clone(),
-        stdin_rx,
-        cmd_rx,
-        project_dir.clone(),
-    ));
+    tokio::spawn(manage_processes(stdin_rx, cmd_rx, project_dir.clone()));
 
     // TODO: watch this
     tokio::spawn(async move {
@@ -135,6 +130,7 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
     Ok(())
 }
 
+#[derive(Debug, Clone)]
 struct MultiplexingSender {
     job_id: JobId,
     tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
@@ -145,17 +141,29 @@ impl MultiplexingSender {
         &self,
         message: Result<impl Into<WorkerMessage>, impl std::error::Error>,
     ) -> Result<(), MultiplexingSenderError> {
+        match message {
+            Ok(v) => self.send_ok(v).await,
+            Err(e) => self.send_err(e).await,
+        }
+    }
+
+    async fn send_ok(
+        &self,
+        message: impl Into<WorkerMessage>,
+    ) -> Result<(), MultiplexingSenderError> {
+        self.send_raw(message.into()).await
+    }
+
+    async fn send_err(&self, e: impl std::error::Error) -> Result<(), MultiplexingSenderError> {
+        self.send_raw(WorkerMessage::Error(SerializedError::new(e)))
+            .await
+    }
+
+    async fn send_raw(&self, message: WorkerMessage) -> Result<(), MultiplexingSenderError> {
         use multiplexing_sender_error::*;
 
-        let message = match message {
-            Ok(v) => v.into(),
-            Err(e) => WorkerMessage::Error(SerializedError::new(e)),
-        };
-
-        let message = Multiplexed(self.job_id, message);
-
         self.tx
-            .send(message)
+            .send(Multiplexed(self.job_id, message))
             .await
             .drop_error_details()
             .context(UnableToSendWorkerMessageSnafu)
@@ -249,7 +257,6 @@ fn parse_working_dir(cwd: Option<String>, project_path: &Path) -> PathBuf {
 }
 
 async fn manage_processes(
-    worker_msg_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
     mut stdin_rx: mpsc::Receiver<Multiplexed<String>>,
     mut cmd_rx: mpsc::Receiver<CommandRequest>,
     project_path: PathBuf,
@@ -257,33 +264,24 @@ async fn manage_processes(
     use process_error::*;
 
     let mut processes = HashMap::new();
-    let mut stdin_senders: HashMap<JobId, mpsc::Sender<String>> = HashMap::new();
+    let mut stdin_senders = HashMap::new();
 
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
-                let (Multiplexed(job_id, req), response_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
-                let ExecuteCommandRequest {
-                    cmd,
-                    args,
-                    envs,
-                    cwd,
-                } = req;
-                let mut child = Command::new(cmd)
-                    .args(args)
-                    .envs(envs)
-                    .current_dir(parse_working_dir(cwd, project_path.as_path()))
-                    .kill_on_drop(true)
-                    .stdin(Stdio::piped())
-                    .stdout(Stdio::piped())
-                    .stderr(Stdio::piped())
-                    .spawn().context(UnableToSpawnProcessSnafu)?;
+                let (Multiplexed(job_id, req), worker_msg_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
 
-                // Preparing for receiving stdin packet.
-                let (stdin_tx, stdin_rx) = mpsc::channel(8);
-                stdin_senders.insert(job_id, stdin_tx);
+                let (mut child, stdin_rx, stdin, stdout, stderr) = match begin_process(req, &project_path, &mut stdin_senders, job_id) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // TODO: add message for started vs current stopped
+                        worker_msg_tx.send_err(e).await.context(UnableToSendExecuteCommandStartedResponseSnafu)?;
+                        continue;
+                    }
+                };
 
-                let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, &mut child, job_id).context(StdioSnafu)?;
+                // TODO: what about these errors?
+                let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, stdin, stdout, stderr).context(StdioSnafu)?;
                 // TODO: watch this spawn
                 tokio::spawn(async move {
                     let r = child.wait().await.context(WaitChildSnafu).map(|status| {
@@ -291,13 +289,14 @@ async fn manage_processes(
                         ExecuteCommandResponse { success }
                     });
 
-                    response_tx
+                    worker_msg_tx
                         .send(r)
                         .await
-                        .context(UnableToSendWorkerMessageSnafu)
+                        .context(UnableToSendExecuteCommandResponseSnafu)
                 });
                 processes.insert(job_id, task_set);
             }
+
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
                 let Multiplexed(job_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
@@ -309,6 +308,51 @@ async fn manage_processes(
     }
 }
 
+fn begin_process(
+    req: ExecuteCommandRequest,
+    project_path: &Path,
+    stdin_senders: &mut HashMap<JobId, mpsc::Sender<String>>,
+    job_id: JobId,
+) -> Result<
+    (
+        Child,
+        mpsc::Receiver<String>,
+        ChildStdin,
+        ChildStdout,
+        ChildStderr,
+    ),
+    ProcessError,
+> {
+    use process_error::*;
+
+    let ExecuteCommandRequest {
+        cmd,
+        args,
+        envs,
+        cwd,
+    } = req;
+    let mut child = Command::new(cmd)
+        .args(args)
+        .envs(envs)
+        .current_dir(parse_working_dir(cwd, project_path))
+        .kill_on_drop(true)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context(UnableToSpawnProcessSnafu)?; // TODO this error should bubble back
+
+    let stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
+    let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
+    let stderr = child.stderr.take().context(UnableToCaptureStderrSnafu)?;
+
+    // Preparing for receiving stdin packet.
+    let (stdin_tx, stdin_rx) = mpsc::channel(8);
+    stdin_senders.insert(job_id, stdin_tx);
+
+    Ok((child, stdin_rx, stdin, stdout, stderr))
+}
+
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum ProcessError {
@@ -316,6 +360,15 @@ pub enum ProcessError {
     UnableToSpawnProcess {
         source: std::io::Error,
     },
+
+    #[snafu(display("Failed to capture child process stdin"))]
+    UnableToCaptureStdin,
+
+    #[snafu(display("Failed to capture child process stdout"))]
+    UnableToCaptureStdout,
+
+    #[snafu(display("Failed to capture child process stderr"))]
+    UnableToCaptureStderr,
 
     #[snafu(display("Command request receiver ended unexpectedly"))]
     CommandRequestReceiverEnded,
@@ -337,23 +390,23 @@ pub enum ProcessError {
         source: std::io::Error,
     },
 
-    #[snafu(display("Failed to send worker message to serialization task"))]
-    UnableToSendWorkerMessage {
+    UnableToSendExecuteCommandStartedResponse {
+        source: MultiplexingSenderError,
+    },
+
+    UnableToSendExecuteCommandResponse {
         source: MultiplexingSenderError,
     },
 }
 
 fn stream_stdio(
-    coordinator_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
+    coordinator_tx: MultiplexingSender,
     mut stdin_rx: mpsc::Receiver<String>,
-    child: &mut Child,
-    job_id: JobId,
+    mut stdin: ChildStdin,
+    stdout: ChildStdout,
+    stderr: ChildStderr,
 ) -> Result<JoinSet<Result<(), StdioError>>, StdioError> {
     use stdio_error::*;
-
-    let mut stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
-    let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
-    let stderr = child.stderr.take().context(UnableToCaptureStderrSnafu)?;
 
     let mut set = JoinSet::new();
 
@@ -381,15 +434,14 @@ fn stream_stdio(
                 .read_line(&mut buffer)
                 .await
                 .context(UnableToReadStdoutSnafu)?;
-            if n != 0 {
-                coordinator_tx_out
-                    .send(Multiplexed(job_id, WorkerMessage::StdoutPacket(buffer)))
-                    .await
-                    .drop_error_details()
-                    .context(UnableToSendStdoutPacketSnafu)?;
-            } else {
+            if n == 0 {
                 break;
             }
+
+            coordinator_tx_out
+                .send(<Result<_>>::Ok(WorkerMessage::StdoutPacket(buffer)))
+                .await
+                .context(UnableToSendStdoutPacketSnafu)?;
         }
         Ok(())
     });
@@ -404,15 +456,14 @@ fn stream_stdio(
                 .read_line(&mut buffer)
                 .await
                 .context(UnableToReadStderrSnafu)?;
-            if n != 0 {
-                coordinator_tx_err
-                    .send(Multiplexed(job_id, WorkerMessage::StderrPacket(buffer)))
-                    .await
-                    .drop_error_details()
-                    .context(UnableToSendStderrPacketSnafu)?;
-            } else {
+            if n == 0 {
                 break;
             }
+
+            coordinator_tx_err
+                .send(<Result<_>>::Ok(WorkerMessage::StderrPacket(buffer)))
+                .await
+                .context(UnableToSendStderrPacketSnafu)?;
         }
         Ok(())
     });
@@ -423,15 +474,6 @@ fn stream_stdio(
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum StdioError {
-    #[snafu(display("Failed to capture child process stdin"))]
-    UnableToCaptureStdin,
-
-    #[snafu(display("Failed to capture child process stdout"))]
-    UnableToCaptureStdout,
-
-    #[snafu(display("Failed to capture child process stderr"))]
-    UnableToCaptureStderr,
-
     #[snafu(display("Failed to receive stdin data"))]
     UnableToReceiveStdinData,
 
@@ -448,10 +490,10 @@ pub enum StdioError {
     UnableToReadStderr { source: std::io::Error },
 
     #[snafu(display("Failed to send stdout packet"))]
-    UnableToSendStdoutPacket { source: mpsc::error::SendError<()> },
+    UnableToSendStdoutPacket { source: MultiplexingSenderError },
 
     #[snafu(display("Failed to send stderr packet"))]
-    UnableToSendStderrPacket { source: mpsc::error::SendError<()> },
+    UnableToSendStderrPacket { source: MultiplexingSenderError },
 }
 
 // stdin/out <--> messages.
