@@ -263,15 +263,16 @@ async fn manage_processes(
 ) -> Result<(), ProcessError> {
     use process_error::*;
 
-    let mut processes = HashMap::new();
+    let mut processes = JoinSet::new();
     let mut stdin_senders = HashMap::new();
+    let (stdin_shutdown_tx, mut stdin_shutdown_rx) = mpsc::channel(8);
 
     loop {
         select! {
             cmd_req = cmd_rx.recv() => {
                 let (Multiplexed(job_id, req), worker_msg_tx) = cmd_req.context(CommandRequestReceiverEndedSnafu)?;
 
-                let (mut child, stdin_rx, stdin, stdout, stderr) = match begin_process(req, &project_path, &mut stdin_senders, job_id) {
+                let (child, stdin_rx, stdin, stdout, stderr) = match process_begin(req, &project_path, &mut stdin_senders, job_id) {
                     Ok(v) => v,
                     Err(e) => {
                         // TODO: add message for started vs current stopped
@@ -280,35 +281,41 @@ async fn manage_processes(
                     }
                 };
 
-                // TODO: what about these errors?
-                let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, stdin, stdout, stderr).context(StdioSnafu)?;
-                // TODO: watch this spawn
-                tokio::spawn(async move {
-                    let r = child.wait().await.context(WaitChildSnafu).map(|status| {
-                        let success = status.success();
-                        ExecuteCommandResponse { success }
-                    });
+                let task_set = stream_stdio(worker_msg_tx.clone(), stdin_rx, stdin, stdout, stderr);
 
-                    worker_msg_tx
-                        .send(r)
-                        .await
-                        .context(UnableToSendExecuteCommandResponseSnafu)
+                processes.spawn({
+                    let stdin_shutdown_tx = stdin_shutdown_tx.clone();
+                    async move {
+                        worker_msg_tx
+                            .send(process_end(child, task_set, stdin_shutdown_tx, job_id).await)
+                            .await
+                            .context(UnableToSendExecuteCommandResponseSnafu)
+                    }
                 });
-                processes.insert(job_id, task_set);
             }
 
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
                 let Multiplexed(job_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
+
                 if let Some(stdin_tx) = stdin_senders.get(&job_id) {
                     stdin_tx.send(packet).await.drop_error_details().context(UnableToSendStdinDataSnafu)?;
                 }
+            }
+
+            job_id = stdin_shutdown_rx.recv() => {
+                let job_id = job_id.context(StdinShutdownReceiverEndedSnafu)?;
+                stdin_senders.remove(&job_id);
+            }
+
+            Some(process) = processes.join_next() => {
+                process.context(ProcessTaskPanickedSnafu)??;
             }
         }
     }
 }
 
-fn begin_process(
+fn process_begin(
     req: ExecuteCommandRequest,
     project_path: &Path,
     stdin_senders: &mut HashMap<JobId, mpsc::Sender<String>>,
@@ -340,7 +347,7 @@ fn begin_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context(UnableToSpawnProcessSnafu)?; // TODO this error should bubble back
+        .context(UnableToSpawnProcessSnafu)?;
 
     let stdin = child.stdin.take().context(UnableToCaptureStdinSnafu)?;
     let stdout = child.stdout.take().context(UnableToCaptureStdoutSnafu)?;
@@ -351,6 +358,31 @@ fn begin_process(
     stdin_senders.insert(job_id, stdin_tx);
 
     Ok((child, stdin_rx, stdin, stdout, stderr))
+}
+
+async fn process_end(
+    mut child: Child,
+    mut task_set: JoinSet<Result<(), StdioError>>,
+    stdin_shutdown_tx: mpsc::Sender<JobId>,
+    job_id: JobId,
+) -> Result<ExecuteCommandResponse, ProcessError> {
+    use process_error::*;
+
+    let status = child.wait().await.context(WaitChildSnafu)?;
+
+    stdin_shutdown_tx
+        .send(job_id)
+        .await
+        .drop_error_details()
+        .context(UnableToSendStdinShutdownSnafu)?;
+
+    while let Some(task) = task_set.join_next().await {
+        task.context(StdioTaskPanickedSnafu)?
+            .context(StdioTaskFailedSnafu)?;
+    }
+
+    let success = status.success();
+    Ok(ExecuteCommandResponse { success })
 }
 
 #[derive(Debug, Snafu)]
@@ -381,13 +413,21 @@ pub enum ProcessError {
         source: mpsc::error::SendError<()>,
     },
 
-    Stdio {
-        source: StdioError,
-    },
-
     #[snafu(display("Failed to wait for child process exiting"))]
     WaitChild {
         source: std::io::Error,
+    },
+
+    UnableToSendStdinShutdown {
+        source: mpsc::error::SendError<()>,
+    },
+
+    StdioTaskPanicked {
+        source: tokio::task::JoinError,
+    },
+
+    StdioTaskFailed {
+        source: StdioError,
     },
 
     UnableToSendExecuteCommandStartedResponse {
@@ -397,6 +437,12 @@ pub enum ProcessError {
     UnableToSendExecuteCommandResponse {
         source: MultiplexingSenderError,
     },
+
+    StdinShutdownReceiverEnded,
+
+    ProcessTaskPanicked {
+        source: tokio::task::JoinError,
+    },
 }
 
 fn stream_stdio(
@@ -405,23 +451,22 @@ fn stream_stdio(
     mut stdin: ChildStdin,
     stdout: ChildStdout,
     stderr: ChildStderr,
-) -> Result<JoinSet<Result<(), StdioError>>, StdioError> {
+) -> JoinSet<Result<(), StdioError>> {
     use stdio_error::*;
 
     let mut set = JoinSet::new();
 
     set.spawn(async move {
         loop {
-            let data = stdin_rx
-                .recv()
-                .await
-                .context(UnableToReceiveStdinDataSnafu)?;
+            let Some(data) = stdin_rx.recv().await else { break };
             stdin
                 .write_all(data.as_bytes())
                 .await
                 .context(UnableToWriteStdinSnafu)?;
             stdin.flush().await.context(UnableToFlushStdinSnafu)?;
         }
+
+        Ok(())
     });
 
     let coordinator_tx_out = coordinator_tx.clone();
@@ -443,6 +488,7 @@ fn stream_stdio(
                 .await
                 .context(UnableToSendStdoutPacketSnafu)?;
         }
+
         Ok(())
     });
 
@@ -465,18 +511,16 @@ fn stream_stdio(
                 .await
                 .context(UnableToSendStderrPacketSnafu)?;
         }
+
         Ok(())
     });
 
-    Ok(set)
+    set
 }
 
 #[derive(Debug, Snafu)]
 #[snafu(module)]
 pub enum StdioError {
-    #[snafu(display("Failed to receive stdin data"))]
-    UnableToReceiveStdinData,
-
     #[snafu(display("Failed to write stdin data"))]
     UnableToWriteStdin { source: std::io::Error },
 
