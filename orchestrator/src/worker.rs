@@ -24,45 +24,16 @@ use crate::{
 
 type CommandRequest = (Multiplexed<ExecuteCommandRequest>, MultiplexingSender);
 
-type Result<T, E = Error> = std::result::Result<T, E>;
-
-#[derive(Debug, Snafu)]
-pub enum Error {
-    UnableToSendWriteFileResponse {
-        source: MultiplexingSenderError,
-    },
-
-    UnableToSendReadFileResponse {
-        source: MultiplexingSenderError,
-    },
-
-    #[snafu(display("Failed to send command execution request"))]
-    UnableToSendCommandExecutionRequest {
-        source: mpsc::error::SendError<()>,
-    },
-
-    #[snafu(display("Failed to send stdin packet"))]
-    UnableToSendStdinPacket {
-        source: mpsc::error::SendError<()>,
-    },
-
-    #[snafu(display("Failed to receive coordinator message from deserialization task"))]
-    UnableToReceiveCoordinatorMessage,
-}
-
-pub async fn listen(project_dir: PathBuf) -> Result<()> {
-    let mut tasks = JoinSet::new();
-
+pub async fn listen(project_dir: PathBuf) -> Result<(), Error> {
     let (coordinator_msg_tx, coordinator_msg_rx) = mpsc::channel(8);
     let (worker_msg_tx, worker_msg_rx) = mpsc::channel(8);
-    spawn_io_queue(&mut tasks, coordinator_msg_tx, worker_msg_rx);
+    let mut io_tasks = spawn_io_queue(coordinator_msg_tx, worker_msg_rx);
 
     let (cmd_tx, cmd_rx) = mpsc::channel(8);
     let (stdin_tx, stdin_rx) = mpsc::channel(8);
-    tokio::spawn(manage_processes(stdin_rx, cmd_rx, project_dir.clone()));
+    let process_task = tokio::spawn(manage_processes(stdin_rx, cmd_rx, project_dir.clone()));
 
-    // TODO: watch this
-    tokio::spawn(handle_coordinator_message(
+    let handler_task = tokio::spawn(handle_coordinator_message(
         coordinator_msg_rx,
         worker_msg_tx,
         project_dir,
@@ -70,12 +41,48 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
         stdin_tx,
     ));
 
-    // Shutdown when any of these critical tasks goes wrong.
-    if tasks.join_next().await.is_some() {
-        tasks.shutdown().await;
+    select! {
+        Some(io_task) = io_tasks.join_next() => {
+            io_task.context(IoTaskExitedSnafu)?.context(IoTaskFailedSnafu)?;
+        }
+
+        process_task = process_task => {
+            process_task.context(ProcessTaskExitedSnafu)?.context(ProcessTaskFailedSnafu)?
+        }
+
+        handler_task = handler_task => {
+            handler_task.context(HandlerTaskExitedSnafu)?.context(HandlerTaskFailedSnafu)?
+        }
     }
 
     Ok(())
+}
+
+#[derive(Debug, Snafu)]
+pub enum Error {
+    IoTaskExited {
+        source: tokio::task::JoinError,
+    },
+
+    IoTaskFailed {
+        source: IoQueueError,
+    },
+
+    ProcessTaskExited {
+        source: tokio::task::JoinError,
+    },
+
+    ProcessTaskFailed {
+        source: ProcessError,
+    },
+
+    HandlerTaskExited {
+        source: tokio::task::JoinError,
+    },
+
+    HandlerTaskFailed {
+        source: HandleCoordinatorMessageError,
+    },
 }
 
 async fn handle_coordinator_message(
@@ -84,7 +91,10 @@ async fn handle_coordinator_message(
     project_dir: PathBuf,
     cmd_tx: mpsc::Sender<CommandRequest>,
     stdin_tx: mpsc::Sender<Multiplexed<String>>,
-) -> Result<()> {
+) -> Result<(), HandleCoordinatorMessageError> {
+    use handle_coordinator_message_error::*;
+
+    // TODO: watch this
     let mut msg_tasks = JoinSet::new();
 
     loop {
@@ -140,6 +150,31 @@ async fn handle_coordinator_message(
             }
         }
     }
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum HandleCoordinatorMessageError {
+    #[snafu(display("Failed to receive coordinator message from deserialization task"))]
+    UnableToReceiveCoordinatorMessage,
+
+    UnableToSendWriteFileResponse {
+        source: MultiplexingSenderError,
+    },
+
+    UnableToSendReadFileResponse {
+        source: MultiplexingSenderError,
+    },
+
+    #[snafu(display("Failed to send command execution request"))]
+    UnableToSendCommandExecutionRequest {
+        source: mpsc::error::SendError<()>,
+    },
+
+    #[snafu(display("Failed to send stdin packet"))]
+    UnableToSendStdinPacket {
+        source: mpsc::error::SendError<()>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -554,12 +589,13 @@ pub enum StdioError {
 
 // stdin/out <--> messages.
 fn spawn_io_queue(
-    tasks: &mut JoinSet<Result<(), IoQueueError>>,
     coordinator_msg_tx: mpsc::Sender<Multiplexed<CoordinatorMessage>>,
     mut worker_msg_rx: mpsc::Receiver<Multiplexed<WorkerMessage>>,
-) {
+) -> JoinSet<Result<(), IoQueueError>> {
     use io_queue_error::*;
     use std::io::{prelude::*, BufReader, BufWriter};
+
+    let mut tasks = JoinSet::new();
 
     tasks.spawn_blocking(move || {
         let stdin = std::io::stdin();
@@ -591,6 +627,8 @@ fn spawn_io_queue(
             stdout.flush().context(UnableToFlushStdoutSnafu)?;
         }
     });
+
+    tasks
 }
 
 #[derive(Debug, Snafu)]
