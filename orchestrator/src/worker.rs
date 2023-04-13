@@ -6,7 +6,7 @@ use std::{
 };
 use tokio::{
     fs,
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::{AsyncBufReadExt, AsyncRead, AsyncWriteExt, BufReader},
     process::{Child, ChildStderr, ChildStdin, ChildStdout, Command},
     select,
     sync::mpsc,
@@ -522,50 +522,14 @@ fn stream_stdio(
         Ok(())
     });
 
-    let coordinator_tx_out = coordinator_tx.clone();
-    set.spawn(async move {
-        let mut stdout_buf = BufReader::new(stdout);
-        loop {
-            // Must be valid UTF-8.
-            let mut buffer = String::new();
-            let n = stdout_buf
-                .read_line(&mut buffer)
-                .await
-                .context(UnableToReadStdoutSnafu)?;
-            if n == 0 {
-                break;
-            }
-
-            coordinator_tx_out
-                .send_ok(WorkerMessage::StdoutPacket(buffer))
-                .await
-                .context(UnableToSendStdoutPacketSnafu)?;
-        }
-
-        Ok(())
+    set.spawn({
+        copy_child_output(stdout, coordinator_tx.clone(), WorkerMessage::StdoutPacket)
+            .context(CopyStdoutSnafu)
     });
 
-    let coordinator_tx_err = coordinator_tx;
-    set.spawn(async move {
-        let mut stderr_buf = BufReader::new(stderr);
-        loop {
-            // Must be valid UTF-8.
-            let mut buffer = String::new();
-            let n = stderr_buf
-                .read_line(&mut buffer)
-                .await
-                .context(UnableToReadStderrSnafu)?;
-            if n == 0 {
-                break;
-            }
-
-            coordinator_tx_err
-                .send_ok(WorkerMessage::StderrPacket(buffer))
-                .await
-                .context(UnableToSendStderrPacketSnafu)?;
-        }
-
-        Ok(())
+    set.spawn({
+        copy_child_output(stderr, coordinator_tx, WorkerMessage::StderrPacket)
+            .context(CopyStderrSnafu)
     });
 
     set
@@ -580,17 +544,52 @@ pub enum StdioError {
     #[snafu(display("Failed to flush stdin data"))]
     UnableToFlushStdin { source: std::io::Error },
 
-    #[snafu(display("Failed to read child process stdout"))]
-    UnableToReadStdout { source: std::io::Error },
+    #[snafu(display("Failed to copy child stdout"))]
+    CopyStdout { source: CopyChildOutputError },
 
-    #[snafu(display("Failed to read child process stderr"))]
-    UnableToReadStderr { source: std::io::Error },
+    #[snafu(display("Failed to copy child stderr"))]
+    CopyStderr { source: CopyChildOutputError },
+}
 
-    #[snafu(display("Failed to send stdout packet"))]
-    UnableToSendStdoutPacket { source: MultiplexingSenderError },
+async fn copy_child_output(
+    output: impl AsyncRead + Unpin,
+    coordinator_tx: MultiplexingSender,
+    mut xform: impl FnMut(String) -> WorkerMessage,
+) -> Result<(), CopyChildOutputError> {
+    use copy_child_output_error::*;
 
-    #[snafu(display("Failed to send stderr packet"))]
-    UnableToSendStderrPacket { source: MultiplexingSenderError },
+    let mut buf = BufReader::new(output);
+
+    loop {
+        // Must be valid UTF-8.
+        let mut buffer = String::new();
+
+        let n = buf
+            .read_line(&mut buffer)
+            .await
+            .context(UnableToReadSnafu)?;
+
+        if n == 0 {
+            break;
+        }
+
+        coordinator_tx
+            .send_ok(xform(buffer))
+            .await
+            .context(UnableToSendSnafu)?;
+    }
+
+    Ok(())
+}
+
+#[derive(Debug, Snafu)]
+#[snafu(module)]
+pub enum CopyChildOutputError {
+    #[snafu(display("Failed to read child output"))]
+    UnableToRead { source: std::io::Error },
+
+    #[snafu(display("Failed to send output packet"))]
+    UnableToSend { source: MultiplexingSenderError },
 }
 
 // stdin/out <--> messages.
