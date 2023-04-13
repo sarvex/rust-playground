@@ -53,7 +53,7 @@ pub enum Error {
 pub async fn listen(project_dir: PathBuf) -> Result<()> {
     let mut tasks = JoinSet::new();
 
-    let (coordinator_msg_tx, mut coordinator_msg_rx) = mpsc::channel(8);
+    let (coordinator_msg_tx, coordinator_msg_rx) = mpsc::channel(8);
     let (worker_msg_tx, worker_msg_rx) = mpsc::channel(8);
     spawn_io_queue(&mut tasks, coordinator_msg_tx, worker_msg_rx);
 
@@ -62,65 +62,13 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
     tokio::spawn(manage_processes(stdin_rx, cmd_rx, project_dir.clone()));
 
     // TODO: watch this
-    tokio::spawn(async move {
-        let mut msg_tasks = JoinSet::new(); // TODO check this
-
-        loop {
-            let Multiplexed(job_id, coordinator_msg) = coordinator_msg_rx
-                .recv()
-                .await
-                .context(UnableToReceiveCoordinatorMessageSnafu)?;
-
-            let worker_msg_tx = || MultiplexingSender {
-                job_id,
-                tx: worker_msg_tx.clone(),
-            };
-
-            match coordinator_msg {
-                CoordinatorMessage::WriteFile(req) => {
-                    let project_dir = project_dir.clone();
-                    let worker_msg_tx = worker_msg_tx();
-
-                    msg_tasks.spawn(async move {
-                        worker_msg_tx
-                            .send(handle_write_file(req, project_dir).await)
-                            .await
-                            .context(UnableToSendWriteFileResponseSnafu)
-                    });
-                }
-
-                CoordinatorMessage::ReadFile(req) => {
-                    let project_dir = project_dir.clone();
-                    let worker_msg_tx = worker_msg_tx();
-
-                    msg_tasks.spawn(async move {
-                        worker_msg_tx
-                            .send(handle_read_file(req, project_dir).await)
-                            .await
-                            .context(UnableToSendReadFileResponseSnafu)
-                    });
-                }
-
-                CoordinatorMessage::ExecuteCommand(req) => {
-                    cmd_tx
-                        .send((Multiplexed(job_id, req), worker_msg_tx()))
-                        .await
-                        .drop_error_details()
-                        .context(UnableToSendCommandExecutionRequestSnafu)?;
-                }
-
-                CoordinatorMessage::StdinPacket(data) => {
-                    stdin_tx
-                        .send(Multiplexed(job_id, data))
-                        .await
-                        .drop_error_details()
-                        .context(UnableToSendStdinPacketSnafu)?;
-                }
-            }
-        }
-
-        <Result<(), Error>>::Ok(())
-    });
+    tokio::spawn(handle_coordinator_message(
+        coordinator_msg_rx,
+        worker_msg_tx,
+        project_dir,
+        cmd_tx,
+        stdin_tx,
+    ));
 
     // Shutdown when any of these critical tasks goes wrong.
     if tasks.join_next().await.is_some() {
@@ -128,6 +76,70 @@ pub async fn listen(project_dir: PathBuf) -> Result<()> {
     }
 
     Ok(())
+}
+
+async fn handle_coordinator_message(
+    mut coordinator_msg_rx: mpsc::Receiver<Multiplexed<CoordinatorMessage>>,
+    worker_msg_tx: mpsc::Sender<Multiplexed<WorkerMessage>>,
+    project_dir: PathBuf,
+    cmd_tx: mpsc::Sender<CommandRequest>,
+    stdin_tx: mpsc::Sender<Multiplexed<String>>,
+) -> Result<()> {
+    let mut msg_tasks = JoinSet::new();
+
+    loop {
+        let Multiplexed(job_id, coordinator_msg) = coordinator_msg_rx
+            .recv()
+            .await
+            .context(UnableToReceiveCoordinatorMessageSnafu)?;
+
+        let worker_msg_tx = || MultiplexingSender {
+            job_id,
+            tx: worker_msg_tx.clone(),
+        };
+
+        match coordinator_msg {
+            CoordinatorMessage::WriteFile(req) => {
+                let project_dir = project_dir.clone();
+                let worker_msg_tx = worker_msg_tx();
+
+                msg_tasks.spawn(async move {
+                    worker_msg_tx
+                        .send(handle_write_file(req, project_dir).await)
+                        .await
+                        .context(UnableToSendWriteFileResponseSnafu)
+                });
+            }
+
+            CoordinatorMessage::ReadFile(req) => {
+                let project_dir = project_dir.clone();
+                let worker_msg_tx = worker_msg_tx();
+
+                msg_tasks.spawn(async move {
+                    worker_msg_tx
+                        .send(handle_read_file(req, project_dir).await)
+                        .await
+                        .context(UnableToSendReadFileResponseSnafu)
+                });
+            }
+
+            CoordinatorMessage::ExecuteCommand(req) => {
+                cmd_tx
+                    .send((Multiplexed(job_id, req), worker_msg_tx()))
+                    .await
+                    .drop_error_details()
+                    .context(UnableToSendCommandExecutionRequestSnafu)?;
+            }
+
+            CoordinatorMessage::StdinPacket(data) => {
+                stdin_tx
+                    .send(Multiplexed(job_id, data))
+                    .await
+                    .drop_error_details()
+                    .context(UnableToSendStdinPacketSnafu)?;
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
