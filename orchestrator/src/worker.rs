@@ -607,14 +607,25 @@ fn spawn_io_queue(
         let mut stdin = BufReader::new(stdin);
 
         loop {
-            let coordinator_msg = bincode::deserialize_from(&mut stdin)
-                .context(UnableToDeserializeCoordinatorMessageSnafu)?;
+            let coordinator_msg = bincode::deserialize_from(&mut stdin);
+            if let Err(e) = &coordinator_msg {
+                if let bincode::ErrorKind::Io(e) = &**e {
+                    if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                        // The coordinator to worker stream is closed
+                        break;
+                    }
+                }
+            };
+            let coordinator_msg =
+                coordinator_msg.context(UnableToDeserializeCoordinatorMessageSnafu)?;
 
             coordinator_msg_tx
                 .blocking_send(coordinator_msg)
                 .drop_error_details()
                 .context(UnableToSendCoordinatorMessageSnafu)?;
         }
+
+        Ok(())
     });
 
     tasks.spawn_blocking(move || {
