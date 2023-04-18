@@ -16,7 +16,7 @@ use tokio::{
     task::{JoinHandle, JoinSet},
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
-use tokio_util::io::SyncIoBridge;
+use tokio_util::{io::SyncIoBridge, sync::CancellationToken};
 
 use crate::{
     message::{
@@ -35,8 +35,9 @@ enum DemultiplexCommand {
 
 #[derive(Debug)]
 pub struct Container {
-    child: Child,
+    task: JoinHandle<Result<()>>,
     commander: Commander,
+    token: CancellationToken,
 }
 
 impl Container {
@@ -134,6 +135,17 @@ impl Container {
             stderr_rx,
         })
     }
+
+    pub async fn shutdown(self) -> Result<()> {
+        let Self {
+            task,
+            commander,
+            token,
+        } = self;
+        drop(commander);
+        token.cancel();
+        task.await.context(ContainerTaskPanickedSnafu)?
+    }
 }
 
 #[derive(Debug)]
@@ -188,7 +200,7 @@ impl Commander {
         loop {
             select! {
                 command = command_rx.recv() => {
-                    let Some(command) = command else { return Ok(()) };
+                    let Some(command) = command else { break };
 
                     match command {
                         DemultiplexCommand::Listen(job_id, waiter) => {
@@ -204,7 +216,7 @@ impl Commander {
                 },
 
                 msg = from_worker_rx.recv() => {
-                    let Multiplexed(job_id, msg) = msg.context(UnableToReceiveFromWorkerSnafu)?;
+                    let Some(Multiplexed(job_id, msg)) = msg else { break };
 
                     if let Some(waiter) = waiting_once.remove(&job_id) {
                         waiter.send(msg).ok(/* Don't care about it */);
@@ -220,6 +232,8 @@ impl Commander {
                 }
             }
         }
+
+        Ok(())
     }
 
     fn next_id(&self) -> JobId {
@@ -307,9 +321,6 @@ pub enum CommanderError {
     #[snafu(display("Could not send a message to the worker"))]
     UnableToSendToWorker { source: mpsc::error::SendError<()> },
 
-    #[snafu(display("Did not receive a response from the worker"))]
-    UnableToReceiveFromWorker,
-
     #[snafu(display("Did not receive the expected response type from the worker"))]
     UnexpectedResponseType,
 
@@ -345,7 +356,32 @@ pub type Result<T, E = Error> = ::std::result::Result<T, E>;
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Reached system process limit"))]
-    SpawnWorker { source: std::io::Error },
+    SpawnWorker {
+        source: std::io::Error,
+    },
+
+    #[snafu(display("Unable to join child process"))]
+    JoinWorker {
+        source: std::io::Error,
+    },
+
+    #[snafu(display("The demultiplexer task panicked"))]
+    DemultiplexerTaskPanicked {
+        source: tokio::task::JoinError,
+    },
+
+    #[snafu(display("The demultiplexer task failed"))]
+    DemultiplexerTaskFailed {
+        source: CommanderError,
+    },
+
+    IoQueuePanicked {
+        source: tokio::task::JoinError,
+    },
+
+    ContainerTaskPanicked {
+        source: tokio::task::JoinError,
+    },
 
     #[snafu(display("Worker process's stdin not captured"))]
     WorkerStdinCapture,
@@ -354,19 +390,24 @@ pub enum Error {
     WorkerStdoutCapture,
 
     #[snafu(display("Failed to flush child stdin"))]
-    WorkerStdinFlush { source: std::io::Error },
+    WorkerStdinFlush {
+        source: std::io::Error,
+    },
 
     #[snafu(display("Failed to deserialize worker message"))]
-    WorkerMessageDeserialization { source: bincode::Error },
+    WorkerMessageDeserialization {
+        source: bincode::Error,
+    },
 
     #[snafu(display("Failed to serialize coordinator message"))]
-    CoordinatorMessageSerialization { source: bincode::Error },
+    CoordinatorMessageSerialization {
+        source: bincode::Error,
+    },
 
     #[snafu(display("Failed to send worker message through channel"))]
-    UnableToSendWorkerMessage { source: mpsc::error::SendError<()> },
-
-    #[snafu(display("Failed to receive coordinator message through channel"))]
-    UnableToReceiveCoordinatorMessage,
+    UnableToSendWorkerMessage {
+        source: mpsc::error::SendError<()>,
+    },
 }
 
 macro_rules! docker_command {
@@ -416,14 +457,17 @@ fn run_worker_in_background(project_dir: &Path) -> Result<(Child, ChildStdin, Ch
 
 // Child stdin/out <--> messages.
 fn spawn_io_queue(
-    tasks: &mut JoinSet<Result<()>>,
     stdin: ChildStdin,
     stdout: ChildStdout,
+    token: CancellationToken,
 ) -> (
+    JoinSet<Result<()>>,
     mpsc::Sender<Multiplexed<CoordinatorMessage>>,
     mpsc::Receiver<Multiplexed<WorkerMessage>>,
 ) {
     use std::io::{prelude::*, BufReader, BufWriter};
+
+    let mut tasks = JoinSet::new();
 
     let (tx, worker_msg_rx) = mpsc::channel(8);
     tasks.spawn_blocking(move || {
@@ -446,36 +490,47 @@ fn spawn_io_queue(
         let mut stdin = BufWriter::new(stdin);
 
         loop {
-            let coordinator_msg = rx
-                .blocking_recv()
-                .context(UnableToReceiveCoordinatorMessageSnafu)?;
+            let coordinator_msg = futures::executor::block_on(async {
+                select! {
+                    () = token.cancelled() => None,
+                    msg = rx.recv() => msg,
+                }
+            });
+
+            let Some(coordinator_msg) = coordinator_msg else { break };
 
             bincode::serialize_into(&mut stdin, &coordinator_msg)
                 .context(CoordinatorMessageSerializationSnafu)?;
 
             stdin.flush().context(WorkerStdinFlushSnafu)?;
         }
+
+        Ok(())
     });
-    (coordinator_msg_tx, worker_msg_rx)
+
+    (tasks, coordinator_msg_tx, worker_msg_rx)
 }
 
 pub fn spawn_container(project_dir: &Path) -> Result<Container> {
-    let mut tasks = JoinSet::new();
-    let (child, stdin, stdout) = run_worker_in_background(project_dir)?;
-    let (to_worker_tx, from_worker_rx) = spawn_io_queue(&mut tasks, stdin, stdout);
-    tokio::spawn(async move {
-        if let Some(task) = tasks.join_next().await {
-            eprintln!("{task:?}");
+    let token = CancellationToken::new();
 
-            tasks.abort_all();
-            while let Some(task) = tasks.join_next().await {
-                eprintln!("{task:?}");
-            }
-        }
-    });
+    let (mut child, stdin, stdout) = run_worker_in_background(project_dir)?;
+    let (mut tasks, to_worker_tx, from_worker_rx) = spawn_io_queue(stdin, stdout, token.clone());
 
     let (command_tx, command_rx) = mpsc::channel(8);
-    tokio::spawn(Commander::demultiplex(command_rx, from_worker_rx));
+    let demultiplex_task = tokio::spawn(Commander::demultiplex(command_rx, from_worker_rx));
+
+    let task = tokio::spawn(async move {
+        let (c, d, t) = join!(child.wait(), demultiplex_task, tasks.join_next());
+        c.context(JoinWorkerSnafu)?;
+        d.context(DemultiplexerTaskPanickedSnafu)?
+            .context(DemultiplexerTaskFailedSnafu)?;
+        if let Some(t) = t {
+            t.context(IoQueuePanickedSnafu)??;
+        }
+
+        Ok(())
+    });
 
     let commander = Commander {
         to_worker_tx,
@@ -483,7 +538,11 @@ pub fn spawn_container(project_dir: &Path) -> Result<Container> {
         id: Default::default(),
     };
 
-    Ok(Container { child, commander })
+    Ok(Container {
+        task,
+        commander,
+        token,
+    })
 }
 
 #[cfg(test)]
@@ -531,6 +590,8 @@ mod tests {
 
         assert!(response.success);
 
+        container.shutdown().await?;
+
         Ok(())
     }
 
@@ -566,6 +627,8 @@ mod tests {
 
         assert!(stderr.contains("Compiling"));
         assert!(stderr.contains("Finished"));
+
+        container.shutdown().await?;
 
         Ok(())
     }

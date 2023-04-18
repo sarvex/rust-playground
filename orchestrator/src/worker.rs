@@ -350,7 +350,7 @@ async fn manage_processes(
 
             stdin_packet = stdin_rx.recv() => {
                 // Dispatch stdin packet to different child by attached command id.
-                let Multiplexed(job_id, packet) = stdin_packet.context(StdinReceiverEndedSnafu)?;
+                let Some(Multiplexed(job_id, packet)) = stdin_packet else { break };
 
                 if let Some(stdin_tx) = stdin_senders.get(&job_id) {
                     stdin_tx.send(packet).await.drop_error_details().context(UnableToSendStdinDataSnafu)?;
@@ -457,9 +457,6 @@ pub enum ProcessError {
 
     #[snafu(display("Failed to capture child process stderr"))]
     UnableToCaptureStderr,
-
-    #[snafu(display("Stdin packet receiver ended unexpectedly"))]
-    StdinReceiverEnded,
 
     #[snafu(display("Failed to send stdin data"))]
     UnableToSendStdinData {
