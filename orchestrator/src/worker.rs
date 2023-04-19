@@ -24,7 +24,9 @@ use crate::{
 
 type CommandRequest = (Multiplexed<ExecuteCommandRequest>, MultiplexingSender);
 
-pub async fn listen(project_dir: PathBuf) -> Result<(), Error> {
+pub async fn listen(project_dir: impl Into<PathBuf>) -> Result<(), Error> {
+    let project_dir = project_dir.into();
+
     let (coordinator_msg_tx, coordinator_msg_rx) = mpsc::channel(8);
     let (worker_msg_tx, worker_msg_rx) = mpsc::channel(8);
     let mut io_tasks = spawn_io_queue(coordinator_msg_tx, worker_msg_rx);
