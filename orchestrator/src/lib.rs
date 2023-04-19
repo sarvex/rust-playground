@@ -35,3 +35,13 @@ impl<T> JoinSetExt<T> for tokio::task::JoinSet<T> {
         })
     }
 }
+
+fn bincode_input_closed<T>(coordinator_msg: &bincode::Result<T>) -> bool {
+    if let Err(e) = coordinator_msg {
+        if let bincode::ErrorKind::Io(e) = &**e {
+            return e.kind() == std::io::ErrorKind::UnexpectedEof;
+        }
+    }
+
+    false
+}

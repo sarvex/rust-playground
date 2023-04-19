@@ -19,6 +19,7 @@ use tokio_stream::{wrappers::ReceiverStream, StreamExt};
 use tokio_util::{io::SyncIoBridge, sync::CancellationToken};
 
 use crate::{
+    bincode_input_closed,
     message::{
         CoordinatorMessage, JobId, Multiplexed, OneToOneResponse, ReadFileRequest,
         ReadFileResponse, SerializedError, WorkerMessage,
@@ -469,13 +470,20 @@ fn spawn_io_queue(
         let mut stdout = BufReader::new(stdout);
 
         loop {
-            let worker_msg = bincode::deserialize_from(&mut stdout)
-                .context(WorkerMessageDeserializationSnafu)?;
+            let worker_msg = bincode::deserialize_from(&mut stdout);
+
+            if bincode_input_closed(&worker_msg) {
+                break;
+            };
+
+            let worker_msg = worker_msg.context(WorkerMessageDeserializationSnafu)?;
 
             tx.blocking_send(worker_msg)
                 .drop_error_details()
                 .context(UnableToSendWorkerMessageSnafu)?;
         }
+
+        Ok(())
     });
 
     let (coordinator_msg_tx, mut rx) = mpsc::channel(8);
