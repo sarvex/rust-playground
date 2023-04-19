@@ -1,6 +1,6 @@
 use snafu::prelude::*;
 use std::{
-    collections::{HashMap, VecDeque},
+    collections::HashMap,
     path::{Path, PathBuf},
     process::Stdio,
     sync::{
@@ -330,24 +330,18 @@ pub enum CommanderError {
 
 #[derive(Debug)]
 pub struct Coordinator {
-    free_containers: VecDeque<Container>,
     worker_project_dir: PathBuf,
 }
 
 impl Coordinator {
-    pub fn new(project_dir: &Path) -> Self {
+    pub fn new(project_dir: impl Into<PathBuf>) -> Self {
         Coordinator {
-            free_containers: VecDeque::new(),
-            worker_project_dir: project_dir.to_path_buf(),
+            worker_project_dir: project_dir.into(),
         }
     }
 
     pub fn allocate(&mut self) -> Result<Container, Error> {
-        if let Some(container) = self.free_containers.pop_front() {
-            Ok(container)
-        } else {
-            spawn_container(self.worker_project_dir.as_path())
-        }
+        spawn_container(&self.worker_project_dir)
     }
 }
 
